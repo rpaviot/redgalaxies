@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "red_galaxy_pipeline"
+version = "1.0.0"
+description = "Red sequence galaxy identification and photometric redshift estimation based on Vakili et al. (2019)"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Romain Paviot", email = "romainpaviot@gmail.com"}
+]
+keywords = [
+    "astronomy",
+    "galaxies",
+    "photometric redshift",
+    "red sequence",
+    "gaussian mixture model"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+
+dependencies = [
+    "numpy>=1.20",
+    "pandas>=1.3",
+    "scipy>=1.7",
+    "scikit-learn>=1.0",
+    "iminuit>=2.0",
+    "astropy>=5.0",
+    "joblib>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "ruff>=0.1",
+]
+docs = [
+    "sphinx>=6.0",
+    "sphinx-rtd-theme>=1.0",
+]
+notebooks = [
+    "jupyter>=1.0",
+    "matplotlib>=3.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/red_galaxy_pipeline"
+Documentation = "https://github.com/yourusername/red_galaxy_pipeline#readme"
+Repository = "https://github.com/yourusername/red_galaxy_pipeline"
+Issues = "https://github.com/yourusername/red_galaxy_pipeline/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["red_galaxy_pipeline*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
