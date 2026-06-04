@@ -790,6 +790,7 @@ class RedCatalogue:
 
     def calibrate_photoz_offset(self, df_spec: pd.DataFrame,
                                 n_nodes: int = 10,
+                                delta_z: Optional[float] = None,
                                 train_fraction: float = 0.5,
                                 method: str = 'differential_evolution',
                                 n_jobs: int = -1,
@@ -819,7 +820,13 @@ class RedCatalogue:
             Spectroscopic galaxy catalog (must have z_spec column)
         n_nodes : int
             Number of redshift nodes for offset spline (default: 10).
-            Creates bins from z_min to z_max with n_nodes points.
+            Creates bins from z_min to z_max with n_nodes points. Ignored if
+            delta_z is given.
+        delta_z : float, optional
+            Node spacing in redshift for the offset spline. If given, nodes are
+            placed from z_min in steps of delta_z (z_min, z_min+delta_z, ...,
+            up to z_max), overriding n_nodes. Lands exactly on z_max when
+            (z_max - z_min) is a multiple of delta_z. Default: None (use n_nodes).
         train_fraction : float
             Fraction of data to use for training (default: 0.50)
         method : str
@@ -863,14 +870,24 @@ class RedCatalogue:
         if self.splines is None:
             raise ValueError("Ridge line not fitted. Run fit_ridge_line() first.")
 
-        # Create z_bins from n_nodes
-        z_bins = np.linspace(self.z_min, self.z_max, n_nodes)
+        # Build z_bins: by spacing (delta_z) if given, else by count (n_nodes).
+        if delta_z is not None:
+            if delta_z <= 0:
+                raise ValueError(f"delta_z must be positive, got {delta_z}")
+            n_intervals = max(int(round((self.z_max - self.z_min) / delta_z)), 1)
+            z_bins = self.z_min + np.arange(n_intervals + 1) * delta_z
+        else:
+            z_bins = np.linspace(self.z_min, self.z_max, n_nodes)
 
         if verbose:
             print("=" * 60)
             print("Photo-z Offset Calibration")
             print("=" * 60)
-            print(f"Using {n_nodes} nodes from z={self.z_min:.2f} to z={self.z_max:.2f}")
+            if delta_z is not None:
+                print(f"Using {len(z_bins)} nodes (Δz={delta_z}) from "
+                      f"z={z_bins[0]:.2f} to z={z_bins[-1]:.2f}")
+            else:
+                print(f"Using {n_nodes} nodes from z={self.z_min:.2f} to z={self.z_max:.2f}")
 
         # Split into train/validation
         n_galaxies = len(df_spec)
