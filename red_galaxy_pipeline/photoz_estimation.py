@@ -9,9 +9,9 @@ See README.md for detailed documentation and usage examples.
 
 import numpy as np
 import pandas as pd
-from typing import Dict, Tuple, Optional, Union, Callable, List
+from typing import Dict, Tuple, Optional, Union, Callable, List, Any
 from scipy.linalg import det, inv
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import CubicSpline, interp1d
 from scipy.optimize import minimize, differential_evolution
 from iminuit import Minuit
 from astropy.cosmology import FlatLambdaCDM
@@ -24,10 +24,22 @@ from red_galaxy_pipeline.utils import create_color_arrays_and_covariance
 DEFAULT_COSMO = FlatLambdaCDM(Om0=0.30, H0=100)
 
 
-def fit_redshift_offset(z_photo: np.ndarray, z_spec: np.ndarray,
-                       z_nodes: np.ndarray) -> CubicSpline:
+def build_offset_interp(z_nodes: np.ndarray, values: np.ndarray,
+                        interp: str = 'cubic'):
+    """Build the Δz(z) offset function with the requested interpolation family.
+
+    'cubic' (default, CubicSpline) or 'linear' (piecewise-linear). Both
+    extrapolate linearly/flat-ish at the edges.
     """
-    Fit cubic spline offset to minimize photo-z bias (L1 norm).
+    if interp == 'linear':
+        return interp1d(z_nodes, values, kind='linear', fill_value='extrapolate')
+    return CubicSpline(z_nodes, values, extrapolate=True)
+
+
+def fit_redshift_offset(z_photo: np.ndarray, z_spec: np.ndarray,
+                       z_nodes: np.ndarray, interp: str = 'cubic') -> CubicSpline:
+    """
+    Fit spline offset to minimize photo-z bias (L1 norm).
 
     Parameters
     ----------
@@ -37,14 +49,16 @@ def fit_redshift_offset(z_photo: np.ndarray, z_spec: np.ndarray,
         Spectroscopic redshifts
     z_nodes : ndarray
         Redshift nodes for the offset spline
+    interp : {'cubic', 'linear'}
+        Interpolation family for the offset Δz(z) (default: cubic).
 
     Returns
     -------
-    offset_func : CubicSpline
+    offset_func : callable
         Offset function Δz(z) such that z_corrected = z_photo + Δz(z_photo)
     """
     def objective(delta_z_vals):
-        delta_z_spline = CubicSpline(z_nodes, delta_z_vals, extrapolate=True)
+        delta_z_spline = build_offset_interp(z_nodes, delta_z_vals, interp)
         corrected_z = z_photo + delta_z_spline(z_photo)
         return np.sum(np.abs(z_spec - corrected_z))  # L1 norm
 
@@ -52,7 +66,7 @@ def fit_redshift_offset(z_photo: np.ndarray, z_spec: np.ndarray,
     x0 = np.zeros_like(z_nodes)
     res = minimize(objective, x0, method='L-BFGS-B')
 
-    return CubicSpline(z_nodes, res.x, extrapolate=True)
+    return build_offset_interp(z_nodes, res.x, interp)
 
 
 def bias_and_scatter(z_bins: np.ndarray, z_spec: np.ndarray,
@@ -197,7 +211,8 @@ def compute_luminosity_diagnostics(z_photo: np.ndarray, z_spec: np.ndarray,
 def save_offset_function(offset_func: CubicSpline, z_nodes: np.ndarray,
                         train_metrics: Dict, val_metrics: Dict,
                         filepath: str,
-                        luminosity_diagnostics: Optional[Dict] = None):
+                        luminosity_diagnostics: Optional[Dict] = None,
+                        interp: str = 'cubic'):
     """
     Save offset function and calibration metrics to .npz file.
 
@@ -227,7 +242,8 @@ def save_offset_function(offset_func: CubicSpline, z_nodes: np.ndarray,
         'train_z_bins': train_metrics.get('z_bins', np.array([])),
         'val_bias': val_metrics.get('bias', np.array([])),
         'val_scatter': val_metrics.get('scatter', np.array([])),
-        'val_z_bins': val_metrics.get('z_bins', np.array([]))
+        'val_z_bins': val_metrics.get('z_bins', np.array([])),
+        'offset_interp': np.array(interp),
     }
 
     # Add luminosity diagnostics if provided
@@ -269,10 +285,12 @@ def load_offset_function(filepath: str) -> Tuple[CubicSpline, Dict]:
     """
     data = np.load(filepath)
 
-    # Reconstruct spline
+    # Reconstruct spline with the persisted interpolation family (legacy files
+    # default to cubic).
     z_nodes = data['z_nodes']
     offset_values = data['offset_values']
-    offset_func = CubicSpline(z_nodes, offset_values, extrapolate=True)
+    interp = str(data['offset_interp']) if 'offset_interp' in data.files else 'cubic'
+    offset_func = build_offset_interp(z_nodes, offset_values, interp)
 
     # Extract base metrics (always present)
     metrics = {
@@ -432,7 +450,8 @@ class PhotoZEstimator:
                  z_min: float = 0.05,
                  z_max: float = 1.0,
                  offset_func: Optional[Callable] = None,
-                 apply_offset: bool = False):
+                 apply_offset: bool = False,
+                 r_splines: Optional[Dict[Tuple[int, int], CubicSpline]] = None):
         self.splines = spline_functions
         self.m_ref_func = m_ref_func
         self.colour_names = colour_names
@@ -442,6 +461,8 @@ class PhotoZEstimator:
         self.z_max = z_max
         self.offset_func = offset_func
         self.apply_offset = apply_offset
+        # Optional cross-covariance r(z) splines, keyed by colour-index pair.
+        self.r_splines = r_splines or {}
 
         if self.apply_offset and self.offset_func is None:
             raise ValueError("apply_offset=True requires offset_func to be provided")
@@ -482,7 +503,14 @@ class PhotoZEstimator:
         C_int : ndarray, shape (n_colors, n_colors)
             Diagonal covariance matrix of intrinsic scatter
         """
-        return np.diag([self.splines[col]['c'](z)**2 for col in self.colour_names])
+        c_z = np.array([self.splines[col]['c'](z) for col in self.colour_names])
+        C_int = np.diag(c_z ** 2)
+        # Off-diagonals from cross-covariance r(z) splines, if present.
+        for (i, j), r_spl in self.r_splines.items():
+            cov_ij = float(r_spl(z)) * c_z[i] * c_z[j]
+            C_int[i, j] = cov_ij
+            C_int[j, i] = cov_ij
+        return C_int
 
     def chi_squared(self, c_obs: np.ndarray, c_model: np.ndarray,
                    C_tot: np.ndarray) -> float:
@@ -563,9 +591,10 @@ class PhotoZEstimator:
         log_p_m_z = self.schechter.log_pdf(m_obs, z)
         log_phi_z = self.schechter.log_normalization(z)
 
-        # Total objective
+        # Total objective (Vakili+19 Eq. 26: −2 ln|dV/dz| with bars inside the log;
+        # dV/dz > 0 so the bars are vacuous and the term is just −2 ln(dV/dz)).
         objective = (chi2 + log_det_C
-                    - 2 * np.abs(log_dV_dz)
+                    - 2 * log_dV_dz
                     - 2 * log_p_m_z
                     - 2 * log_phi_z)
 
@@ -843,7 +872,8 @@ class PhotoZFitter:
                  z_min: float = 0.05,
                  z_max: float = 1.0,
                  offset_func: Optional[Callable] = None,
-                 apply_offset: bool = False):
+                 apply_offset: bool = False,
+                 r_splines: Optional[Dict[Tuple[int, int], CubicSpline]] = None):
         # Create Schechter function
         if schechter_params is None:
             raise ValueError(
@@ -858,7 +888,8 @@ class PhotoZFitter:
             spline_functions, m_ref_func, colour_names,
             schechter=schechter, cosmology=cosmology,
             z_min=z_min, z_max=z_max,
-            offset_func=offset_func, apply_offset=apply_offset
+            offset_func=offset_func, apply_offset=apply_offset,
+            r_splines=r_splines,
         )
 
         self.colour_names = colour_names

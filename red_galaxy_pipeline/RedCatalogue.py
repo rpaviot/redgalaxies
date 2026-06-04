@@ -20,7 +20,8 @@ from red_galaxy_pipeline.utils import (
 )
 from red_galaxy_pipeline.gmm_selection import RedSequenceSelector
 from red_galaxy_pipeline.red_sequence_fitting import (
-    RedSequenceFitter, save_params, load_params, make_spline_functions
+    RedSequenceFitter, save_params, load_params, make_spline_functions,
+    make_r_cross_splines,
 )
 from red_galaxy_pipeline.photoz_estimation import (
     PhotoZFitter, create_schechter_from_params,
@@ -44,6 +45,7 @@ class RedCatalogue:
                  z_spec_col: str = 'z_spec',
                  z_min: float = 0.05,
                  z_max: float = 0.95,
+                 z_pad: float = 0.05,
                  delta_a: float = 0.05,
                  delta_b: float = 0.10,
                  delta_c: float = 0.15,
@@ -51,9 +53,14 @@ class RedCatalogue:
                  regularization_config: Optional[Dict] = None,
                  cosmology = None,
                  z_bin_width: float = 0.03,
-                 color_switch_z: float = 0.5,
+                 color_switch_z: float = 0.42,
                  use_gmm_binning: bool = True,
-                 auto_compute_luminosity: bool = True):
+                 auto_compute_luminosity: bool = True,
+                 node_z_min: Optional[float] = None,
+                 node_z_max: Optional[float] = None,
+                 interp_method: Optional[str] = None,
+                 smooth_abc_s: float = 0.0,
+                 loss: str = 'l2'):
         """
         Parameters
         ----------
@@ -118,6 +125,7 @@ class RedCatalogue:
         self.z_spec_col = z_spec_col
         self.z_min = z_min
         self.z_max = z_max
+        self.z_pad = z_pad
         self.delta_a = delta_a
         self.delta_b = delta_b
         self.delta_c = delta_c
@@ -129,6 +137,18 @@ class RedCatalogue:
         self.color_switch_z = color_switch_z
         self.use_gmm_binning = use_gmm_binning
         self.auto_compute_luminosity = auto_compute_luminosity
+        # Ridge-line spline node range (science window). If unset, falls back to
+        # the data range as before. Decoupling these lets a/b/c(z) nodes live on
+        # [0.1, 1.0] while the fit still uses padded data in [0.05, 1.05], so the
+        # boundary nodes are pinned by galaxies straddling them instead of being
+        # planted in the sparse padding region.
+        self.node_z_min = node_z_min
+        self.node_z_max = node_z_max
+        self.interp_method = interp_method
+        self.smooth_abc_s = float(smooth_abc_s or 0.0)
+        # Ridge-fit data-fidelity loss: 'l2' (Gaussian, default) or 'l1'
+        # (Laplace, robust to outlier tails that inflate c(z)).
+        self.loss = loss
 
         # State variables
         self.df_red = None  # Selected red galaxies
@@ -144,6 +164,9 @@ class RedCatalogue:
     def select_red_sequence(self, df: pd.DataFrame,
                            sigma_multiplier: float = 2.0,
                            save_filepath: Optional[str] = None,
+                           n_jobs: int = 1,
+                           n_realizations: int = 1,
+                           random_state: Optional[int] = None,
                            verbose: bool = True) -> pd.DataFrame:
         """
         Step 1: Select red sequence galaxies using XD GMM.
@@ -169,13 +192,18 @@ class RedCatalogue:
         DataFrame
             Selected red sequence galaxies
         """
-        # Apply redshift cuts
-        df_cut = df[(df[self.z_spec_col] >= self.z_min) &
-                   (df[self.z_spec_col] <= self.z_max)].copy()
+        # Pad the user's [z_min, z_max] science window by ±z_pad so the tails
+        # are available for quantifying scatter at the limits downstream.
+        z_lo = self.z_min - self.z_pad
+        z_hi = self.z_max + self.z_pad
+        df_cut = df[(df[self.z_spec_col] >= z_lo) &
+                   (df[self.z_spec_col] <= z_hi)].copy()
 
         if verbose:
             print(f"Input: {len(df)} galaxies")
-            print(f"After z cuts [{self.z_min}, {self.z_max}]: {len(df_cut)} galaxies")
+            print(f"After z cuts [{z_lo:.4f}, {z_hi:.4f}] "
+                  f"(science [{self.z_min}, {self.z_max}] ±{self.z_pad}): "
+                  f"{len(df_cut)} galaxies")
 
         # Run XD GMM selection
         selector = RedSequenceSelector(
@@ -186,7 +214,12 @@ class RedCatalogue:
             sigma_multiplier=sigma_multiplier,
             z_bin_width=self.z_bin_width,
             color_switch_z=self.color_switch_z,
-            use_binning=self.use_gmm_binning
+            use_binning=self.use_gmm_binning,
+            z_min=z_lo,
+            z_max=z_hi,
+            n_jobs=n_jobs,
+            n_realizations=n_realizations,
+            random_state=random_state,
         )
 
         self.df_red = selector.select_red_sequence(verbose=verbose)
@@ -209,6 +242,11 @@ class RedCatalogue:
                       method: str = 'single',
                       smooth_mref: bool = False,
                       smooth_s: float = 0.15,
+                      fit_cross_covariance: bool = False,
+                      delta_r: Optional[float] = None,
+                      r_prior_width: float = 0.45,
+                      cross_cov_iterations: int = 1,
+                      cross_cov_tol: float = 1e-3,
                       save_filepath: Optional[str] = None,
                       verbose: bool = True) -> Dict:
         """
@@ -248,10 +286,27 @@ class RedCatalogue:
             df = df[(df[self.z_spec_col] >= self.z_min) &
                    (df[self.z_spec_col] <= self.z_max)].copy()
 
+        # Spline node range. By default, clamp to the actual galaxy redshift
+        # range so the spline doesn't extend into empty regions opened up by
+        # step1's padding + binning rounding. If node_z_min/node_z_max are given,
+        # plant the nodes on that (narrower) science window instead while still
+        # fitting on the full padded sample — galaxies in the padding then pin
+        # the boundary nodes rather than spawning runaway extrapolated nodes.
+        z_data_min = float(df[self.z_spec_col].min())
+        z_data_max = float(df[self.z_spec_col].max())
+        z_node_min = self.node_z_min if self.node_z_min is not None else z_data_min
+        z_node_max = self.node_z_max if self.node_z_max is not None else z_data_max
+
         if verbose:
             print(f"Fitting ridge line with {len(df)} red galaxies")
             print(f"  Method: {method}")
             print(f"  Node spacings: Δa={self.delta_a}, Δb={self.delta_b}, Δc={self.delta_c}")
+            print(f"  Node range: [{z_node_min:.4f}, {z_node_max:.4f}] "
+                  f"(data [{z_data_min:.4f}, {z_data_max:.4f}], "
+                  f"science window [{self.z_min}, {self.z_max}])")
+            print(f"  Interpolation: {self.interp_method or 'cubic (default)'}"
+                  + (f", post-hoc smooth s={self.smooth_abc_s}"
+                     if self.smooth_abc_s else ""))
             if smooth_mref:
                 print(f"  Using smoothed m_ref (s={smooth_s})")
 
@@ -263,12 +318,15 @@ class RedCatalogue:
 
         # Initialize fitter
         self.fitter = RedSequenceFitter(
-            z_min=self.z_min,
-            z_max=self.z_max,
+            z_min=z_node_min,
+            z_max=z_node_max,
             delta_a=self.delta_a,
             delta_b=self.delta_b,
             delta_c=self.delta_c,
-            regularization_config=self.regularization_config
+            regularization_config=self.regularization_config,
+            interp_method=self.interp_method,
+            smooth_abc_s=self.smooth_abc_s,
+            loss=self.loss,
         )
 
         # Setup data (pass m_ref_func to use proper reference magnitude)
@@ -277,9 +335,16 @@ class RedCatalogue:
             m_ref_func=self.m_ref_func
         )
 
-        # Fit
+        # Fit (Stage A: a/b/c per color; optional Stage B: r(z) cross-cov)
         self.fit_results = self.fitter.fit(
-            galaxy_data, C_obs, mi_ref, self.color_names, method=method
+            galaxy_data, C_obs, mi_ref, self.color_names, method=method,
+            fit_cross_covariance=fit_cross_covariance,
+            color_definitions=self.color_definitions,
+            delta_r=delta_r,
+            r_prior_width=r_prior_width,
+            cross_cov_iterations=cross_cov_iterations,
+            cross_cov_tol=cross_cov_tol,
+            verbose=verbose,
         )
 
         # Build spline functions
@@ -443,6 +508,10 @@ class RedCatalogue:
                 msg += " with offset correction"
             print(msg)
 
+        # Build optional r(z) cross-covariance splines from fit results
+        r_splines = make_r_cross_splines(self.fit_results, self.color_names) \
+            if self.fit_results is not None else {}
+
         # Initialize photo-z fitter
         self.photoz_fitter = PhotoZFitter(
             spline_functions=self.splines,
@@ -453,7 +522,8 @@ class RedCatalogue:
             z_min=self.z_min,
             z_max=self.z_max,
             offset_func=offset_func,
-            apply_offset=offset
+            apply_offset=offset,
+            r_splines=r_splines,
         )
 
         # Estimate photo-z
@@ -727,6 +797,7 @@ class RedCatalogue:
                                 save_filepath: Optional[str] = None,
                                 compute_luminosity_diagnostics: bool = False,
                                 l_thresholds: List[float] = [0.5, 1.0],
+                                offset_interp: str = 'cubic',
                                 verbose: bool = True) -> Tuple[Callable, Dict]:
         """
         Calibrate photo-z offset function using spectroscopic sample.
@@ -826,6 +897,10 @@ class RedCatalogue:
             if n_jobs != 1:
                 print(f"  Using {n_jobs if n_jobs > 0 else 'all'} CPU cores")
 
+        # Optional cross-cov r(z) splines for downstream photo-z chi^2
+        r_splines = make_r_cross_splines(self.fit_results, self.color_names) \
+            if self.fit_results is not None else {}
+
         # Create temporary PhotoZFitter without offset
         temp_fitter = PhotoZFitter(
             spline_functions=self.splines,
@@ -836,7 +911,8 @@ class RedCatalogue:
             z_min=self.z_min,
             z_max=self.z_max,
             offset_func=None,
-            apply_offset=False
+            apply_offset=False,
+            r_splines=r_splines,
         )
 
         df_train_phot = temp_fitter.estimate_photoz(
@@ -881,7 +957,17 @@ class RedCatalogue:
         if verbose:
             print(f"\nFitting offset function with {len(z_bins)} nodes...")
 
-        offset_func = fit_redshift_offset(z_photo_train, z_spec_train, z_bins)
+        # iminuit returns NaN on failed fits; drop those before L-BFGS-B
+        # so the offset spline parameter search doesn't blow up.
+        valid = np.isfinite(z_photo_train) & np.isfinite(z_spec_train)
+        n_dropped = int((~valid).sum())
+        if n_dropped > 0 and verbose:
+            print(f"  Dropping {n_dropped} galaxies with NaN photo-z "
+                  f"({100*n_dropped/len(valid):.2f}%)")
+        offset_func = fit_redshift_offset(
+            z_photo_train[valid], z_spec_train[valid], z_bins,
+            interp=offset_interp
+        )
 
         # Validate on validation set
         if len(df_val) > 0:
@@ -898,7 +984,8 @@ class RedCatalogue:
                 z_min=self.z_min,
                 z_max=self.z_max,
                 offset_func=offset_func,
-                apply_offset=True
+                apply_offset=True,
+                r_splines=r_splines,
             )
 
             df_val_phot = val_fitter.estimate_photoz(
@@ -973,7 +1060,8 @@ class RedCatalogue:
             'z_nodes': z_bins,
             'train_metrics': train_metrics,
             'val_metrics': val_metrics,
-            'luminosity_diagnostics': lum_diag_to_save
+            'luminosity_diagnostics': lum_diag_to_save,
+            'offset_interp': offset_interp,
         }
 
         # Save if filepath provided
@@ -1356,7 +1444,8 @@ class RedCatalogue:
             data['train_metrics'],
             data['val_metrics'],
             filepath,
-            data.get('luminosity_diagnostics')
+            data.get('luminosity_diagnostics'),
+            interp=data.get('offset_interp', 'cubic'),
         )
 
         if verbose:

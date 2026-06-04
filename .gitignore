@@ -34,6 +34,7 @@ env/
 
 # Claude Code
 .claude/
+CLAUDE.md
 
 # Jupyter Notebook
 .ipynb_checkpoints/
@@ -51,3 +52,5 @@ htmlcov/
 # *.fits
 # *.csv
 # *.hdf5
+*.pdf
+DR1.ipynb
