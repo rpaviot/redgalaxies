@@ -23,7 +23,8 @@ from red_galaxy_pipeline.utils import create_color_arrays_and_covariance, parse_
 
 
 def setup_spline_nodes(z_min: float, z_max: float,
-                       delta_a: float, delta_b: float, delta_c: float) -> Dict[str, np.ndarray]:
+                       delta_a: float, delta_b: float, delta_c: float,
+                       cap_last_node: bool = False) -> Dict[str, np.ndarray]:
     """
     Setup spline node positions for a(z), b(z), c(z).
 
@@ -39,6 +40,15 @@ def setup_spline_nodes(z_min: float, z_max: float,
     science window) as ``z_min``/``z_max`` — node placement is decided there,
     not by edge-anchoring inside this grid.
 
+    Parameters
+    ----------
+    cap_last_node : bool, optional
+        If True, clamp any last node that overshoots ``z_max`` back to
+        ``z_max``. With the default spacings only c(z) (Δ=0.15) overshoots
+        (last node 1.10 for a [0.05, 1.05] window); capping anchors that node
+        at 1.05 where galaxies still live, instead of letting it float into the
+        empty high-z region. a(z)/b(z) already land on z_max so are unaffected.
+
     Returns
     -------
     nodes : dict
@@ -47,7 +57,10 @@ def setup_spline_nodes(z_min: float, z_max: float,
     def _grid(delta: float) -> np.ndarray:
         # ceil with a tiny tolerance so an exact multiple doesn't add a node.
         n_steps = int(np.ceil((z_max - z_min) / delta - 1e-9))
-        return z_min + np.arange(n_steps + 1) * delta
+        grid = z_min + np.arange(n_steps + 1) * delta
+        if cap_last_node and grid[-1] > z_max:
+            grid[-1] = z_max
+        return grid
 
     return {'a': _grid(delta_a), 'b': _grid(delta_b), 'c': _grid(delta_c)}
 
@@ -402,7 +415,8 @@ def fit_red_sequence(galaxy_data: Tuple[np.ndarray, np.ndarray, np.ndarray],
                     delta_a: float, delta_b: float, delta_c: float,
                     colour_names: Optional[List[str]] = None,
                     regularization_config: Optional[Dict] = None,
-                    loss: str = 'l2') -> Dict:
+                    loss: str = 'l2',
+                    cap_last_node: bool = False) -> Dict:
     """
     Fit red sequence parameters jointly across all colors.
 
@@ -432,7 +446,8 @@ def fit_red_sequence(galaxy_data: Tuple[np.ndarray, np.ndarray, np.ndarray],
     """
     colors, mi_j, z_j = galaxy_data
     n_colors = len(colors)
-    nodes = setup_spline_nodes(z_min, z_max, delta_a, delta_b, delta_c)
+    nodes = setup_spline_nodes(z_min, z_max, delta_a, delta_b, delta_c,
+                               cap_last_node=cap_last_node)
 
     if colour_names is None:
         colour_names = [str(i) for i in range(n_colors)]
@@ -486,7 +501,8 @@ def fit_red_sequence_single_colour(galaxy_data: Tuple[np.ndarray, np.ndarray, np
                                    delta_a: float, delta_b: float, delta_c: float,
                                    colour_names: Optional[List[str]] = None,
                                    regularization_config: Optional[Dict] = None,
-                                   loss: str = 'l2') -> Dict:
+                                   loss: str = 'l2',
+                                   cap_last_node: bool = False) -> Dict:
     """
     Fit red sequence parameters independently for each color.
 
@@ -516,7 +532,8 @@ def fit_red_sequence_single_colour(galaxy_data: Tuple[np.ndarray, np.ndarray, np
     """
     colors, mi_j, z_j = galaxy_data
     n_colors = len(colors)
-    nodes = setup_spline_nodes(z_min, z_max, delta_a, delta_b, delta_c)
+    nodes = setup_spline_nodes(z_min, z_max, delta_a, delta_b, delta_c,
+                               cap_last_node=cap_last_node)
 
     if colour_names is None:
         colour_names = [str(i) for i in range(n_colors)]
@@ -1134,7 +1151,8 @@ class RedSequenceFitter:
                  regularization_config: Optional[Dict] = None,
                  interp_method: Optional[str] = None,
                  smooth_abc_s: float = 0.0,
-                 loss: str = 'l2'):
+                 loss: str = 'l2',
+                 cap_last_node: bool = False):
         self.z_min = z_min
         self.z_max = z_max
         self.delta_a = delta_a
@@ -1146,6 +1164,7 @@ class RedSequenceFitter:
         self.interp_method = interp_method or INTERP_METHOD
         self.smooth_abc_s = float(smooth_abc_s or 0.0)
         self.loss = loss
+        self.cap_last_node = bool(cap_last_node)
 
         self.results = None
         self.splines = None
@@ -1250,7 +1269,7 @@ class RedSequenceFitter:
                 self.z_min, self.z_max,
                 self.delta_a, self.delta_b, self.delta_c,
                 colour_names, self.regularization_config,
-                loss=self.loss,
+                loss=self.loss, cap_last_node=self.cap_last_node,
             )
         elif method == 'joint':
             self.results = fit_red_sequence(
@@ -1258,7 +1277,7 @@ class RedSequenceFitter:
                 self.z_min, self.z_max,
                 self.delta_a, self.delta_b, self.delta_c,
                 colour_names, self.regularization_config,
-                loss=self.loss,
+                loss=self.loss, cap_last_node=self.cap_last_node,
             )
         else:
             raise ValueError(f"Unknown method: {method}")

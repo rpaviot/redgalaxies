@@ -60,7 +60,8 @@ class RedCatalogue:
                  node_z_max: Optional[float] = None,
                  interp_method: Optional[str] = None,
                  smooth_abc_s: float = 0.0,
-                 loss: str = 'l2'):
+                 loss: str = 'l2',
+                 cap_last_node: bool = False):
         """
         Parameters
         ----------
@@ -149,6 +150,11 @@ class RedCatalogue:
         # Ridge-fit data-fidelity loss: 'l2' (Gaussian, default) or 'l1'
         # (Laplace, robust to outlier tails that inflate c(z)).
         self.loss = loss
+        # If True, clamp the overshooting last a/b/c(z) node back to the node
+        # window's z_max (only c overshoots with default spacings), anchoring
+        # c(z) at 1.05 instead of letting it float to 1.10 in the empty high-z
+        # region.
+        self.cap_last_node = bool(cap_last_node)
 
         # State variables
         self.df_red = None  # Selected red galaxies
@@ -327,6 +333,7 @@ class RedCatalogue:
             interp_method=self.interp_method,
             smooth_abc_s=self.smooth_abc_s,
             loss=self.loss,
+            cap_last_node=self.cap_last_node,
         )
 
         # Setup data (pass m_ref_func to use proper reference magnitude)
