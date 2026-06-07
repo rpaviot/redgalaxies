@@ -442,6 +442,7 @@ class RedCatalogue:
                        n_jobs: int = 1,
                        return_chi2: bool = False,
                        offset: bool = False,
+                       use_cross_covariance: bool = True,
                        verbose: bool = True) -> pd.DataFrame:
         """
         Step 3: Estimate photometric redshifts.
@@ -464,6 +465,11 @@ class RedCatalogue:
         offset : bool
             If True, apply offset correction. Uses self.offset_func if available,
             otherwise raises an error (run calibrate_photoz_offset first).
+        use_cross_covariance : bool
+            If True (default), use the intrinsic cross-covariance r(z) off-diagonals
+            from the ridgeline fit (C_int_ij = r_ij(z)·c_i(z)·c_j(z)). If False, force
+            C_int diagonal (zero cross-correlations) regardless of what the ridgeline
+            carries — diagnostic for the DR1 wide photo-z failure.
         verbose : bool
             Print progress
 
@@ -508,9 +514,12 @@ class RedCatalogue:
                 msg += " with offset correction"
             print(msg)
 
-        # Build optional r(z) cross-covariance splines from fit results
+        # Build optional r(z) cross-covariance splines from fit results.
+        # use_cross_covariance=False forces C_int diagonal (zero cross-correlation).
         r_splines = make_r_cross_splines(self.fit_results, self.color_names) \
-            if self.fit_results is not None else {}
+            if (use_cross_covariance and self.fit_results is not None) else {}
+        if verbose and not use_cross_covariance:
+            print("  cross-covariance DISABLED (C_int forced diagonal)")
 
         # Initialize photo-z fitter
         self.photoz_fitter = PhotoZFitter(
