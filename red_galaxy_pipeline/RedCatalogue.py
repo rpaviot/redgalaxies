@@ -16,7 +16,8 @@ from typing import List, Tuple, Union, Optional, Dict, Callable
 from scipy.interpolate import CubicSpline, splrep, splev
 
 from red_galaxy_pipeline.utils import (
-    parse_colors, create_magnitude_reference, create_color_arrays_and_covariance
+    parse_colors, create_magnitude_reference, build_mref_function,
+    create_color_arrays_and_covariance
 )
 from red_galaxy_pipeline.gmm_selection import RedSequenceSelector
 from red_galaxy_pipeline.red_sequence_fitting import (
@@ -163,6 +164,7 @@ class RedCatalogue:
         self.m_ref_func = None  # Reference magnitude function
         self.m_ref_z = None  # Reference magnitude redshift nodes
         self.m_ref_values = None  # Reference magnitude values
+        self.mref_bin = 0.03  # m_ref(z) bin width (overridden by fit_ridge_line)
         self.fitter = None  # RedSequenceFitter instance
         self.photoz_fitter = None  # PhotoZFitter instance
         self.offset_func = None  # Photo-z offset function
@@ -248,6 +250,7 @@ class RedCatalogue:
                       method: str = 'single',
                       smooth_mref: bool = False,
                       smooth_s: float = 0.15,
+                      mref_bin: float = 0.03,
                       fit_cross_covariance: bool = False,
                       delta_r: Optional[float] = None,
                       r_prior_width: float = 0.45,
@@ -283,6 +286,7 @@ class RedCatalogue:
         dict
             Fitted parameters with keys 'nodes', 'a_params', 'b_params', 'c_params'
         """
+        self.mref_bin = mref_bin
         if df is None:
             if self.df_red is None:
                 raise ValueError("No red galaxy sample. Run select_red_sequence first.")
@@ -318,7 +322,7 @@ class RedCatalogue:
 
         # Create reference magnitude function and store underlying data
         self.m_ref_func, self.m_ref_z, self.m_ref_values = create_magnitude_reference(
-            df, self.z_spec_col, self.magnitude_col,
+            df, self.z_spec_col, self.magnitude_col, bin_width=self.mref_bin,
             smooth_mref=smooth_mref, smooth_s=smooth_s, return_data=True
         )
 
@@ -396,11 +400,11 @@ class RedCatalogue:
             m_ref_z, m_ref_values = m_ref_data
             self.m_ref_z = m_ref_z
             self.m_ref_values = m_ref_values
-            if smooth_mref:
-                tck = splrep(m_ref_z, m_ref_values, s=smooth_s)
-                self.m_ref_func = lambda z: splev(z, tck)
-            else:
-                self.m_ref_func = CubicSpline(m_ref_z, m_ref_values)
+            # Flat-clamp outside the bin-center range (same helper as the fit
+            # path) so the stored nodes are evaluated identically here.
+            self.m_ref_func = build_mref_function(
+                m_ref_z, m_ref_values, smooth_mref=smooth_mref, smooth_s=smooth_s
+            )
         else:
             self.m_ref_func = None
             self.m_ref_z = None
@@ -501,7 +505,8 @@ class RedCatalogue:
             # Create default m_ref_func if not available
             if self.df_red is not None:
                 self.m_ref_func = create_magnitude_reference(
-                    self.df_red, self.z_spec_col, self.magnitude_col
+                    self.df_red, self.z_spec_col, self.magnitude_col,
+                    bin_width=self.mref_bin
                 )
             else:
                 raise ValueError("No reference magnitude function. Run select_red_sequence or fit_ridge_line first.")
@@ -639,7 +644,7 @@ class RedCatalogue:
         if smooth_mref:
             self.m_ref_func = create_magnitude_reference(
                 df_filtered, self.z_spec_col, self.magnitude_col,
-                smooth_mref=True, smooth_s=smooth_s
+                bin_width=self.mref_bin, smooth_mref=True, smooth_s=smooth_s
             )
             mi_ref = self.m_ref_func(df_filtered[self.z_spec_col].values)
 
@@ -649,7 +654,8 @@ class RedCatalogue:
             # Use existing m_ref function or create new one
             if self.m_ref_func is None:
                 self.m_ref_func = create_magnitude_reference(
-                    df_filtered, self.z_spec_col, self.magnitude_col
+                    df_filtered, self.z_spec_col, self.magnitude_col,
+                    bin_width=self.mref_bin
                 )
             mi_ref = self.m_ref_func(df_filtered[self.z_spec_col].values)
 

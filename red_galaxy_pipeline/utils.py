@@ -181,10 +181,37 @@ def asinh_magnitudes(flux: np.ndarray, flux_err: np.ndarray) -> Tuple[np.ndarray
     return mag, mag_err
 
 
+def build_mref_function(z_nodes: np.ndarray,
+                        m_ref_values: np.ndarray,
+                        smooth_mref: bool = False,
+                        smooth_s: float = 0.15):
+    """Build the m_ref(z) callable from node values, with FLAT clamping outside
+    the node range.
+
+    m_ref nodes are binned medians at *bin centers*; above the last center (and
+    below the first) the data does not constrain m_ref, so the value is held flat
+    at the boundary node rather than letting the cubic/spline extrapolate (which
+    runs away on the steepening high-z tail). This gives m_ref the same fail-safe
+    edge behaviour the a/b/c(z) splines already have (their evaluation is clamped
+    to the node range in the fitter). Used by BOTH the fit path
+    (create_magnitude_reference) and the photo-z load path (load_ridge_line) so
+    the two cannot diverge.
+    """
+    z_nodes = np.asarray(z_nodes, dtype=float)
+    lo, hi = float(z_nodes[0]), float(z_nodes[-1])
+    if smooth_mref:
+        tck = splrep(z_nodes, m_ref_values, s=smooth_s)
+        base = lambda zz: splev(zz, tck)
+    else:
+        base = CubicSpline(z_nodes, m_ref_values)
+    return lambda z: base(np.clip(z, lo, hi))
+
+
 def create_magnitude_reference(df: pd.DataFrame,
                                 z_col: str = 'z_spec',
                                 mag_col: str = 'mag_v2',
                                 z_bins: np.ndarray = None,
+                                bin_width: float = 0.03,
                                 smooth_mref: bool = False,
                                 smooth_s: float = 0.15,
                                 return_data: bool = False):
@@ -200,7 +227,12 @@ def create_magnitude_reference(df: pd.DataFrame,
     mag_col : str
         Column name for reference magnitude
     z_bins : ndarray, optional
-        Redshift bin edges. If None, uses 0.03 spacing from min to max redshift.
+        Redshift bin edges. If None, uses ``bin_width`` spacing from min to max
+        redshift.
+    bin_width : float
+        Bin width in z when ``z_bins`` is None (default: 0.03). Wider bins (e.g.
+        0.05) pool more galaxies per bin, reducing median noise in the sparse
+        high-z bins at the cost of pulling the last bin center inward.
     smooth_mref : bool
         If True, use splrep smoothing instead of CubicSpline (default: False)
     smooth_s : float
@@ -225,7 +257,7 @@ def create_magnitude_reference(df: pd.DataFrame,
     if z_bins is None:
         z_min = df[z_col].min()
         z_max = df[z_col].max()
-        z_bins = np.arange(z_min, z_max + 0.03, 0.03)
+        z_bins = np.arange(z_min, z_max + bin_width, bin_width)
 
     z_mid = (z_bins[1:] + z_bins[:-1]) / 2.0
     m_ref_values = np.zeros(len(z_mid))
@@ -245,15 +277,9 @@ def create_magnitude_reference(df: pd.DataFrame,
 
     m_ref_values = np.interp(z_mid, z_mid[valid_mask], m_ref_values[valid_mask])
 
-    # Create spline function
-    if smooth_mref:
-        # Use splrep with smoothing
-        tck = splrep(z_mid, m_ref_values, s=smooth_s)
-        m_ref_func = lambda z: splev(z, tck)
-    else:
-        # Use cubic spline interpolation (no smoothing)
-        spline = CubicSpline(z_mid, m_ref_values)
-        m_ref_func = spline
+    # Build the m_ref(z) callable (flat-clamped outside the bin-center range)
+    m_ref_func = build_mref_function(z_mid, m_ref_values,
+                                     smooth_mref=smooth_mref, smooth_s=smooth_s)
 
     if return_data:
         return m_ref_func, z_mid, m_ref_values
