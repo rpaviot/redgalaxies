@@ -495,6 +495,73 @@ def fit_red_sequence(galaxy_data: Tuple[np.ndarray, np.ndarray, np.ndarray],
     return extract_named_params(model, params, colour_names, errors)
 
 
+class _LogCModel:
+    """Fit log(c) instead of c for the scatter nodes.
+
+    MIGRAD's box-bound transform has zero gradient at the limits, so c-nodes
+    in a flat likelihood valley rail at the 0.001 floor (seen on the last
+    r-i c(z) node). In log space c > 0 is built in and there is no nearby
+    boundary, so the flat direction stays climbable.
+    """
+
+    def __init__(self, base, c_idx):
+        self.base = base
+        self.c_idx = frozenset(c_idx)
+        self.param_names = base.param_names
+
+    def __call__(self, *params):
+        p = [np.exp(v) if k in self.c_idx else v
+             for k, v in enumerate(params)]
+        return self.base(*p)
+
+
+def _run_minuit_robust(model, init, limits, rail_rtol: float = 0.05):
+    """Simplex-seeded MIGRAD with a railed-parameter rescue pass.
+
+    MIGRAD's internal bound transform has zero gradient at box limits, so a
+    parameter that drifts onto its bound inside a flat likelihood valley gets
+    stuck there while the fit still reports success (seen on the last c(z)
+    node of the r-i ridgeline). Strategy: simplex pre-fit + strategy=2, then
+    if any parameter lands within ``rail_rtol`` of its bound, re-seed those
+    parameters away from the bound and re-run MIGRAD; keep the better NLL.
+    """
+    m = Minuit(model, *init)
+    m.errordef = 1.0
+    m.limits = limits
+    m.strategy = 2
+    m.simplex()
+    m.migrad()
+
+    def railed_indices(values):
+        out = []
+        for k, (v, (lo, hi)) in enumerate(zip(values, limits)):
+            span = hi - lo
+            if v - lo < rail_rtol * span or hi - v < rail_rtol * span:
+                out.append(k)
+        return out
+
+    railed = railed_indices(m.values)
+    if railed:
+        reinit = list(m.values)
+        for k in railed:
+            lo, hi = limits[k]
+            # pull railed parameters to the inner quarter of their range
+            reinit[k] = lo + 0.25 * (hi - lo) if reinit[k] - lo < hi - reinit[k] \
+                else hi - 0.25 * (hi - lo)
+        m2 = Minuit(model, *reinit)
+        m2.errordef = 1.0
+        m2.limits = limits
+        m2.strategy = 2
+        m2.migrad()
+        print(f"  [minuit-robust] {len(railed)} railed param(s) "
+              f"{[model.param_names[k] for k in railed]}: "
+              f"rescue NLL={m2.fval:.1f} vs original NLL={m.fval:.1f} -> "
+              f"{'rescue' if m2.fval < m.fval else 'original'} kept", flush=True)
+        if m2.fval < m.fval:
+            m = m2
+    return m
+
+
 def fit_red_sequence_single_colour(galaxy_data: Tuple[np.ndarray, np.ndarray, np.ndarray],
                                    C_obs: np.ndarray, mi_ref: np.ndarray,
                                    z_min: float, z_max: float,
@@ -559,13 +626,43 @@ def fit_red_sequence_single_colour(galaxy_data: Tuple[np.ndarray, np.ndarray, np
                  [(-0.5, 0.5)] * len(nodes['b']) +
                  [(0.001, 0.4)] * len(nodes['c']))
 
-        m = Minuit(model, *init)
-        m.errordef = 1.0
-        m.limits = limits
-        m.migrad()
+        import os as _os
+        if _os.environ.get("RIDGELINE_OPTIMIZER", "").lower() == "lbfgsb":
+            from scipy.optimize import minimize as _scipy_min
+            r0 = _scipy_min(lambda x: model(*x), np.asarray(init, float),
+                            method="L-BFGS-B", bounds=limits,
+                            options={"maxiter": 20000, "maxfun": 200000,
+                                     "ftol": 1e-12, "gtol": 1e-10})
+            print(f"  [lbfgsb] colour {colour_names[i]}: success={r0.success} "
+                  f"nit={r0.nit} NLL={r0.fun:.1f} ({r0.message})", flush=True)
+            names = model.param_names
+            params = dict(zip(names, r0.x))
+            try:
+                errors = dict(zip(names, np.sqrt(np.diag(
+                    r0.hess_inv.todense()))))
+            except Exception:
+                errors = dict(zip(names, np.zeros(len(names))))
+            sub = extract_named_params(model, params,
+                                       [colour_names[i]], errors)
+            results[colour_names[i]] = sub[colour_names[i]]
+            continue
 
-        params = dict(zip(model.param_names, m.values))
-        errors = dict(zip(model.param_names, m.errors))
+        # log-c reparametrization: same a/b treatment, c fitted as log(c).
+        n_ab = len(nodes['a']) + len(nodes['b'])
+        c_idx = range(n_ab, n_ab + len(nodes['c']))
+        log_model = _LogCModel(model, c_idx)
+        init_log = init[:n_ab] + [np.log(0.1)] * len(nodes['c'])
+        limits_log = (limits[:n_ab]
+                      + [(np.log(1e-4), np.log(0.4))] * len(nodes['c']))
+        m = _run_minuit_robust(log_model, init_log, limits_log)
+
+        vals = list(m.values)
+        errs = list(m.errors)
+        for k in c_idx:
+            vals[k] = np.exp(vals[k])
+            errs[k] = vals[k] * errs[k]  # err_c = c * err_logc
+        params = dict(zip(model.param_names, vals))
+        errors = dict(zip(model.param_names, errs))
 
         # Print final loss breakdown if regularization with verbose
         if regularization_config and regularization_config.get('verbose', False):
