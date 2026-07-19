@@ -495,26 +495,6 @@ def fit_red_sequence(galaxy_data: Tuple[np.ndarray, np.ndarray, np.ndarray],
     return extract_named_params(model, params, colour_names, errors)
 
 
-class _LogCModel:
-    """Fit log(c) instead of c for the scatter nodes.
-
-    MIGRAD's box-bound transform has zero gradient at the limits, so c-nodes
-    in a flat likelihood valley rail at the 0.001 floor (seen on the last
-    r-i c(z) node). In log space c > 0 is built in and there is no nearby
-    boundary, so the flat direction stays climbable.
-    """
-
-    def __init__(self, base, c_idx):
-        self.base = base
-        self.c_idx = frozenset(c_idx)
-        self.param_names = base.param_names
-
-    def __call__(self, *params):
-        p = [np.exp(v) if k in self.c_idx else v
-             for k, v in enumerate(params)]
-        return self.base(*p)
-
-
 def _run_minuit_robust(model, init, limits, rail_rtol: float = 0.05):
     """Simplex-seeded MIGRAD with a railed-parameter rescue pass.
 
@@ -647,22 +627,10 @@ def fit_red_sequence_single_colour(galaxy_data: Tuple[np.ndarray, np.ndarray, np
             results[colour_names[i]] = sub[colour_names[i]]
             continue
 
-        # log-c reparametrization: same a/b treatment, c fitted as log(c).
-        n_ab = len(nodes['a']) + len(nodes['b'])
-        c_idx = range(n_ab, n_ab + len(nodes['c']))
-        log_model = _LogCModel(model, c_idx)
-        init_log = init[:n_ab] + [np.log(0.1)] * len(nodes['c'])
-        limits_log = (limits[:n_ab]
-                      + [(np.log(1e-4), np.log(0.4))] * len(nodes['c']))
-        m = _run_minuit_robust(log_model, init_log, limits_log)
+        m = _run_minuit_robust(model, init, limits)
 
-        vals = list(m.values)
-        errs = list(m.errors)
-        for k in c_idx:
-            vals[k] = np.exp(vals[k])
-            errs[k] = vals[k] * errs[k]  # err_c = c * err_logc
-        params = dict(zip(model.param_names, vals))
-        errors = dict(zip(model.param_names, errs))
+        params = dict(zip(model.param_names, m.values))
+        errors = dict(zip(model.param_names, m.errors))
 
         # Print final loss breakdown if regularization with verbose
         if regularization_config and regularization_config.get('verbose', False):
