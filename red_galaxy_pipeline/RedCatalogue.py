@@ -256,6 +256,7 @@ class RedCatalogue:
                       r_prior_width: float = 0.45,
                       cross_cov_iterations: int = 1,
                       cross_cov_tol: float = 1e-3,
+                      mref_data: Optional[Tuple[np.ndarray, np.ndarray]] = None,
                       save_filepath: Optional[str] = None,
                       verbose: bool = True) -> Dict:
         """
@@ -320,11 +321,23 @@ class RedCatalogue:
             if smooth_mref:
                 print(f"  Using smoothed m_ref (s={smooth_s})")
 
-        # Create reference magnitude function and store underlying data
-        self.m_ref_func, self.m_ref_z, self.m_ref_values = create_magnitude_reference(
-            df, self.z_spec_col, self.magnitude_col, bin_width=self.mref_bin,
-            smooth_mref=smooth_mref, smooth_s=smooth_s, return_data=True
-        )
+        # Create reference magnitude function and store underlying data.
+        # mref_data=(z_nodes, values) overrides the per-sample binned medians so
+        # several samples can share one pivot m_ref(z) (comparable a/b nodes).
+        if mref_data is not None:
+            self.m_ref_z, self.m_ref_values = (np.asarray(mref_data[0], float),
+                                               np.asarray(mref_data[1], float))
+            self.m_ref_func = build_mref_function(
+                self.m_ref_z, self.m_ref_values,
+                smooth_mref=smooth_mref, smooth_s=smooth_s)
+            if verbose:
+                print(f"  Using EXTERNAL m_ref(z): {len(self.m_ref_z)} nodes, "
+                      f"z=[{self.m_ref_z[0]:.3f},{self.m_ref_z[-1]:.3f}]")
+        else:
+            self.m_ref_func, self.m_ref_z, self.m_ref_values = create_magnitude_reference(
+                df, self.z_spec_col, self.magnitude_col, bin_width=self.mref_bin,
+                smooth_mref=smooth_mref, smooth_s=smooth_s, return_data=True
+            )
 
         # Initialize fitter
         self.fitter = RedSequenceFitter(
