@@ -510,6 +510,15 @@ class PhotoZEstimator:
             cov_ij = float(r_spl(z)) * c_z[i] * c_z[j]
             C_int[i, j] = cov_ij
             C_int[j, i] = cov_ij
+        if self.r_splines:
+            # Each r(z) is bounded to |r|<1 per pair, but the JOINT matrix can
+            # still be indefinite (e.g. r_01=r_12=0.95 with r_02 pinned at 0),
+            # making det(C_tot)<0 -> NaN in the objective. Project to the
+            # nearest PSD matrix by flooring eigenvalues.
+            eigval, eigvec = np.linalg.eigh(C_int)
+            floor = 1e-6 * max(c_z.max() ** 2, 1e-12)
+            if eigval[0] < floor:
+                C_int = (eigvec * np.maximum(eigval, floor)) @ eigvec.T
         return C_int
 
     def chi_squared(self, c_obs: np.ndarray, c_model: np.ndarray,
@@ -628,12 +637,22 @@ class PhotoZEstimator:
         chi2 : float (only if return_chi2=True)
             Chi-squared at best-fit redshift
         """
-        if method == 'iminuit':
-            z_best = self._estimate_iminuit(c_obs, m_obs, C_obs, z_init)
-        elif method == 'differential_evolution':
-            z_best = self._estimate_differential_evolution(c_obs, m_obs, C_obs)
-        else:
-            raise ValueError(f"Unknown method: {method}. Use 'iminuit' or 'differential_evolution'")
+        # Non-finite photometry (NaN/inf mags, errors, covariance) makes the
+        # optimizers raise deep inside scipy/linalg; on wide-survey input a
+        # single such row must not kill the batch — it just gets NaN.
+        if (not np.all(np.isfinite(c_obs)) or not np.isfinite(m_obs)
+                or not np.all(np.isfinite(C_obs))):
+            return (np.nan, np.nan) if return_chi2 else np.nan
+
+        try:
+            if method == 'iminuit':
+                z_best = self._estimate_iminuit(c_obs, m_obs, C_obs, z_init)
+            elif method == 'differential_evolution':
+                z_best = self._estimate_differential_evolution(c_obs, m_obs, C_obs)
+            else:
+                raise ValueError(f"Unknown method: {method}. Use 'iminuit' or 'differential_evolution'")
+        except (ValueError, RuntimeError, np.linalg.LinAlgError):
+            return (np.nan, np.nan) if return_chi2 else np.nan
 
         # Apply offset correction if enabled
         if self.apply_offset and not np.isnan(z_best):
