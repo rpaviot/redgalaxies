@@ -22,7 +22,7 @@ from red_galaxy_pipeline.utils import (
 from red_galaxy_pipeline.gmm_selection import RedSequenceSelector
 from red_galaxy_pipeline.red_sequence_fitting import (
     RedSequenceFitter, save_params, load_params, make_spline_functions,
-    make_r_cross_splines,
+    make_r_cross_splines, load_truncation,
 )
 from red_galaxy_pipeline.photoz_estimation import (
     PhotoZFitter, create_schechter_from_params,
@@ -62,7 +62,8 @@ class RedCatalogue:
                  interp_method: Optional[str] = None,
                  smooth_abc_s: float = 0.0,
                  loss: str = 'l2',
-                 cap_last_node: bool = False):
+                 cap_last_node: bool = False,
+                 truncation: Optional[str] = None):
         """
         Parameters
         ----------
@@ -156,6 +157,13 @@ class RedCatalogue:
         # c(z) at 1.05 instead of letting it float to 1.10 in the empty high-z
         # region.
         self.cap_last_node = bool(cap_last_node)
+        # Optional step-1 selection-edge model (path to the npz written by
+        # measure_step1_edge.py). When set, the ridgeline fit is corrected for
+        # the truncation the step-1 chi^2 cut imprints on the sample, which
+        # otherwise biases c(z) low wherever photometric errors dominate.
+        self.truncation_file = truncation
+        self.truncation = (load_truncation(truncation)
+                           if truncation is not None else None)
 
         # State variables
         self.df_red = None  # Selected red galaxies
@@ -351,6 +359,7 @@ class RedCatalogue:
             smooth_abc_s=self.smooth_abc_s,
             loss=self.loss,
             cap_last_node=self.cap_last_node,
+            truncation=self.truncation,
         )
 
         # Setup data (pass m_ref_func to use proper reference magnitude)

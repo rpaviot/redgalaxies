@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 from typing import List, Tuple, Dict, Optional, Union, Callable
 from scipy.interpolate import interp1d, CubicSpline, splrep, splev
+from scipy.special import erf
 from iminuit import Minuit
 
 from red_galaxy_pipeline.utils import create_color_arrays_and_covariance, parse_colors
@@ -145,6 +146,64 @@ def build_param_interp(z_nodes: np.ndarray, parameter_values: np.ndarray,
                     fill_value='extrapolate')
 
 
+def load_truncation(filepath: str) -> Dict[str, Tuple[Callable, Callable]]:
+    """Load a step-1 selection-edge model written by ``measure_step1_edge.py``.
+
+    The step-1 GMM selection keeps a galaxy only if its colour residual satisfies
+    ``|delta| < t``, so the retained sample is a *truncated* draw from the red
+    sequence.  Fitting an untruncated Gaussian to it biases the intrinsic scatter
+    c(z) low -- badly, once the photometric term dominates.  redMaPPer handles
+    this by normalising the likelihood by the surviving probability mass
+    (Rykoff et al. 2014, arXiv:1303.3562, Eq. 29); this loads the edge model that
+    supplies ``t`` per galaxy.
+
+    The edge is parameterised as ``t^2 = kappa(z) * C_phot + const(z)``, which is
+    the shape the step-1 cut imprints (it cuts on
+    ``delta^2 / (S_mod^2 + C_phot)``).  ``kappa`` and ``const`` are *not*
+    separately meaningful -- only the line they define is -- so always fit and
+    use them as a pair.
+
+    Returns
+    -------
+    dict
+        ``{colour_name: (kappa_func, const_func)}``.
+    """
+    d = np.load(filepath, allow_pickle=True)
+    method = str(d['interp_method']) if 'interp_method' in d.files else 'linear'
+    nodes = np.asarray(d['nodes_trunc'], dtype=float)
+    out = {}
+    for col in [str(c) for c in d['colors']]:
+        out[col] = (
+            build_param_interp(nodes, np.asarray(d[f'{col}_kappa_values'], float),
+                               method=method),
+            build_param_interp(nodes, np.asarray(d[f'{col}_const_values'], float),
+                               method=method),
+        )
+    return out
+
+
+def truncation_limits(truncation: Optional[Dict[str, Tuple[Callable, Callable]]],
+                      colour_names: List[str], z_j: np.ndarray,
+                      C_obs: np.ndarray) -> Optional[List[np.ndarray]]:
+    """Evaluate the per-galaxy truncation limit ``t`` for each colour.
+
+    Returns ``None`` when no truncation model is supplied, which restores the
+    plain (untruncated) likelihood exactly.
+    """
+    if truncation is None:
+        return None
+    limits = []
+    for i, name in enumerate(colour_names):
+        if name not in truncation:
+            raise KeyError(
+                f"truncation model has no entry for colour {name!r}; "
+                f"it covers {sorted(truncation)}")
+        kappa_f, const_f = truncation[name]
+        t_sq = kappa_f(z_j) * np.asarray(C_obs[i], dtype=float) + const_f(z_j)
+        limits.append(np.sqrt(np.clip(t_sq, 1e-12, None)))
+    return limits
+
+
 def interpolate_parameters(z_nodes: np.ndarray, parameter_values: np.ndarray,
                           z_eval: np.ndarray,
                           method: Optional[str] = None) -> np.ndarray:
@@ -199,12 +258,20 @@ class RedSequenceModel:
     def __init__(self, galaxy_data: Tuple[np.ndarray, np.ndarray, np.ndarray],
                  C_obs: np.ndarray, mi_ref: np.ndarray,
                  nodes: Dict[str, np.ndarray], n_colors: int,
-                 loss: str = 'l2'):
+                 loss: str = 'l2',
+                 trunc_t: Optional[List[np.ndarray]] = None):
         self.colors, self.mi_j, self.z_j = galaxy_data
         self.C_obs = C_obs
         self.mi_ref = mi_ref
         self.nodes = nodes
         self.n_colors = n_colors
+        # Per-galaxy step-1 selection edge |delta| < t, one array per colour, or
+        # None for the plain untruncated likelihood. See load_truncation().
+        self.trunc_t = trunc_t
+        if trunc_t is not None and loss == 'l1':
+            raise NotImplementedError(
+                "truncation correction is only derived for loss='l2' (Gaussian); "
+                "a truncated Laplace needs a different normalisation")
         # 'l2' = Gaussian NLL (chi^2 + 2 log sigma).
         # 'l1' = Laplace NLL (robust to outliers); c(z) parameterizes the
         #        Gaussian-equivalent sigma (Var=2b^2), so no extra 1.4826 factor
@@ -263,6 +330,16 @@ class RedSequenceModel:
             else:
                 # Gaussian -2 log L (chi^2 + 2 log sigma).
                 nll = np.sum(residual**2 / sigma**2) + 2 * np.sum(np.log(sigma))
+
+            if self.trunc_t is not None:
+                # Step 1 kept only |residual| < t, so the data are a truncated
+                # draw and the model must be normalised by the surviving mass
+                # (redMaPPer Eq. 29). t is FIXED input, not a fit parameter --
+                # that is what makes this term informative: shrinking c shrinks
+                # sigma, raises t/sigma, drives erf -> 1 and its log -> 0, which
+                # penalises exactly the collapse the plain Gaussian rewards.
+                frac = erf(self.trunc_t[i] / (np.sqrt(2.0) * sigma))
+                nll += 2 * np.sum(np.log(np.clip(frac, 1e-300, None)))
             total_loss += nll
 
         return total_loss
@@ -295,8 +372,10 @@ class RedSequenceModelRegularized(RedSequenceModel):
                  C_obs: np.ndarray, mi_ref: np.ndarray,
                  nodes: Dict[str, np.ndarray], n_colors: int,
                  regularization_config: Optional[Dict] = None,
-                 loss: str = 'l2'):
-        super().__init__(galaxy_data, C_obs, mi_ref, nodes, n_colors, loss=loss)
+                 loss: str = 'l2',
+                 trunc_t: Optional[List[np.ndarray]] = None):
+        super().__init__(galaxy_data, C_obs, mi_ref, nodes, n_colors, loss=loss,
+                         trunc_t=trunc_t)
         self.reg_config = regularization_config or {}
 
     def __call__(self, *params):
@@ -416,7 +495,8 @@ def fit_red_sequence(galaxy_data: Tuple[np.ndarray, np.ndarray, np.ndarray],
                     colour_names: Optional[List[str]] = None,
                     regularization_config: Optional[Dict] = None,
                     loss: str = 'l2',
-                    cap_last_node: bool = False) -> Dict:
+                    cap_last_node: bool = False,
+                    trunc_t: Optional[List[np.ndarray]] = None) -> Dict:
     """
     Fit red sequence parameters jointly across all colors.
 
@@ -456,10 +536,10 @@ def fit_red_sequence(galaxy_data: Tuple[np.ndarray, np.ndarray, np.ndarray],
     if regularization_config:
         model = RedSequenceModelRegularized(galaxy_data, C_obs, mi_ref, nodes,
                                            n_colors, regularization_config,
-                                           loss=loss)
+                                           loss=loss, trunc_t=trunc_t)
     else:
         model = RedSequenceModel(galaxy_data, C_obs, mi_ref, nodes, n_colors,
-                                 loss=loss)
+                                 loss=loss, trunc_t=trunc_t)
 
     # Initial values and limits
     init = []
@@ -549,7 +629,8 @@ def fit_red_sequence_single_colour(galaxy_data: Tuple[np.ndarray, np.ndarray, np
                                    colour_names: Optional[List[str]] = None,
                                    regularization_config: Optional[Dict] = None,
                                    loss: str = 'l2',
-                                   cap_last_node: bool = False) -> Dict:
+                                   cap_last_node: bool = False,
+                                   trunc_t: Optional[List[np.ndarray]] = None) -> Dict:
     """
     Fit red sequence parameters independently for each color.
 
@@ -591,13 +672,14 @@ def fit_red_sequence_single_colour(galaxy_data: Tuple[np.ndarray, np.ndarray, np
     for i in range(n_colors):
         data_i = ([colors[i]], mi_j, z_j)
 
+        t_i = None if trunc_t is None else [trunc_t[i]]
         if regularization_config:
             model = RedSequenceModelRegularized(data_i, [C_obs[i]], mi_ref,
                                                nodes, 1, regularization_config,
-                                               loss=loss)
+                                               loss=loss, trunc_t=t_i)
         else:
             model = RedSequenceModel(data_i, [C_obs[i]], mi_ref, nodes, 1,
-                                     loss=loss)
+                                     loss=loss, trunc_t=t_i)
 
         init = ([1.0] * len(nodes['a']) +
                 [0.0] * len(nodes['b']) +
@@ -1217,7 +1299,8 @@ class RedSequenceFitter:
                  interp_method: Optional[str] = None,
                  smooth_abc_s: float = 0.0,
                  loss: str = 'l2',
-                 cap_last_node: bool = False):
+                 cap_last_node: bool = False,
+                 truncation: Optional[Dict[str, Tuple[Callable, Callable]]] = None):
         self.z_min = z_min
         self.z_max = z_max
         self.delta_a = delta_a
@@ -1230,6 +1313,8 @@ class RedSequenceFitter:
         self.smooth_abc_s = float(smooth_abc_s or 0.0)
         self.loss = loss
         self.cap_last_node = bool(cap_last_node)
+        # Step-1 selection-edge model {colour: (kappa_f, const_f)} or None.
+        self.truncation = truncation
 
         self.results = None
         self.splines = None
@@ -1328,6 +1413,13 @@ class RedSequenceFitter:
         global INTERP_METHOD
         INTERP_METHOD = self.interp_method
 
+        trunc_t = truncation_limits(self.truncation, colour_names,
+                                    galaxy_data[2], C_obs)
+        if verbose and trunc_t is not None:
+            med = [f"{n}:{np.median(t):.4f}" for n, t in zip(colour_names, trunc_t)]
+            print(f"  Truncation-corrected fit (redMaPPer Eq.29); median t per "
+                  f"colour: {', '.join(med)}")
+
         if method == 'single':
             self.results = fit_red_sequence_single_colour(
                 galaxy_data, C_obs, mi_ref,
@@ -1335,6 +1427,7 @@ class RedSequenceFitter:
                 self.delta_a, self.delta_b, self.delta_c,
                 colour_names, self.regularization_config,
                 loss=self.loss, cap_last_node=self.cap_last_node,
+                trunc_t=trunc_t,
             )
         elif method == 'joint':
             self.results = fit_red_sequence(
@@ -1343,6 +1436,7 @@ class RedSequenceFitter:
                 self.delta_a, self.delta_b, self.delta_c,
                 colour_names, self.regularization_config,
                 loss=self.loss, cap_last_node=self.cap_last_node,
+                trunc_t=trunc_t,
             )
         else:
             raise ValueError(f"Unknown method: {method}")
