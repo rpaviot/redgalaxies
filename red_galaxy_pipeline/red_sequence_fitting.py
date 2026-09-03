@@ -23,6 +23,21 @@ from iminuit import Minuit
 from red_galaxy_pipeline.utils import create_color_arrays_and_covariance, parse_colors
 
 
+def c_bounds() -> Tuple[float, float]:
+    """Optimiser bounds on the intrinsic-scatter nodes c(z).
+
+    The upper bound is a numerical guard, not a physical statement, so it is
+    settable via ``RIDGELINE_C_MAX`` (default 0.4, the historical value).
+    Raise it whenever a fit rails: a node parked exactly on the bound is a
+    CENSORED result, and ``success=True`` will not tell you so -- L-BFGS-B
+    reports convergence at a bound just as happily as at an interior minimum.
+    That failure mode is the mirror image of the c -> 0.001 collapse the
+    truncation correction was added to cure.
+    """
+    import os as _os
+    return (0.001, float(_os.environ.get("RIDGELINE_C_MAX", "0.4")))
+
+
 def setup_spline_nodes(z_min: float, z_max: float,
                        delta_a: float, delta_b: float, delta_c: float,
                        cap_last_node: bool = False) -> Dict[str, np.ndarray]:
@@ -552,7 +567,7 @@ def fit_red_sequence(galaxy_data: Tuple[np.ndarray, np.ndarray, np.ndarray],
         limits += [(-0.5, 0.5)] * len(nodes['b'])
 
         init += [0.1] * len(nodes['c'])
-        limits += [(0.001, 0.4)] * len(nodes['c'])
+        limits += [c_bounds()] * len(nodes['c'])
 
     # Fit
     m = Minuit(model, *init)
@@ -686,7 +701,7 @@ def fit_red_sequence_single_colour(galaxy_data: Tuple[np.ndarray, np.ndarray, np
                 [0.1] * len(nodes['c']))
         limits = ([(0.2, 3.5)] * len(nodes['a']) +
                  [(-0.5, 0.5)] * len(nodes['b']) +
-                 [(0.001, 0.4)] * len(nodes['c']))
+                 [c_bounds()] * len(nodes['c']))
 
         import os as _os
         if _os.environ.get("RIDGELINE_OPTIMIZER", "").lower() == "lbfgsb":
@@ -697,6 +712,20 @@ def fit_red_sequence_single_colour(galaxy_data: Tuple[np.ndarray, np.ndarray, np
                                      "ftol": 1e-12, "gtol": 1e-10})
             print(f"  [lbfgsb] colour {colour_names[i]}: success={r0.success} "
                   f"nit={r0.nit} NLL={r0.fun:.1f} ({r0.message})", flush=True)
+            # success=True is reported at a bound just as at an interior
+            # minimum, so a railed c(z) node is a CENSORED fit that looks
+            # converged. Say so loudly -- see c_bounds().
+            _lo, _hi = c_bounds()
+            _nc = len(nodes['c'])
+            _cvals = np.asarray(r0.x[-_nc:], float)
+            _rail = [(float(nodes['c'][k]), float(v)) for k, v in enumerate(_cvals)
+                     if v >= _hi * (1 - 1e-6) or v <= _lo * (1 + 1e-6)]
+            if _rail:
+                print(f"  [lbfgsb] WARNING colour {colour_names[i]}: "
+                      f"{len(_rail)} c(z) node(s) AT A BOUND "
+                      f"[{_lo:g}, {_hi:g}] -- censored, not converged: "
+                      + ", ".join(f"z={z:.2f}:c={v:.4f}" for z, v in _rail),
+                      flush=True)
             names = model.param_names
             params = dict(zip(names, r0.x))
             try:
@@ -1008,7 +1037,7 @@ def fit_red_sequence_with_r_fixed(
         init += list(src[cn]['b']['values'])
         limits += [(-0.5, 0.5)] * len(nodes['b'])
         init += list(src[cn]['c']['values'])
-        limits += [(0.001, 0.4)] * len(nodes['c'])
+        limits += [c_bounds()] * len(nodes['c'])
 
     m = Minuit(model, *init)
     m.errordef = 1.0
