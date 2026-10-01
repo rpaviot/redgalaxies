@@ -22,7 +22,8 @@ from red_galaxy_pipeline.utils import (
 from red_galaxy_pipeline.gmm_selection import RedSequenceSelector
 from red_galaxy_pipeline.red_sequence_fitting import (
     RedSequenceFitter, save_params, load_params, make_spline_functions,
-    make_r_cross_splines, load_truncation,
+    make_r_cross_splines, load_truncation, load_background,
+    load_params, make_spline_functions,
 )
 from red_galaxy_pipeline.photoz_estimation import (
     PhotoZFitter, create_schechter_from_params,
@@ -63,7 +64,10 @@ class RedCatalogue:
                  smooth_abc_s: float = 0.0,
                  loss: str = 'l2',
                  cap_last_node: bool = False,
-                 truncation: Optional[str] = None):
+                 truncation: Optional[str] = None,
+                 background: Optional[str] = None,
+                 background_ref: Optional[str] = None,
+                 delta_p: Optional[float] = None):
         """
         Parameters
         ----------
@@ -164,6 +168,23 @@ class RedCatalogue:
         self.truncation_file = truncation
         self.truncation = (load_truncation(truncation)
                            if truncation is not None else None)
+        # Optional Eq.31 background model (path to the npz written by
+        # measure_background.py). When set, the ridgeline fit models the
+        # surviving contaminants as a second mixture component instead of
+        # letting c(z) widen to swallow them. Pair it with --truncation: the
+        # two corrections push c in OPPOSITE directions and only make sense
+        # together.
+        self.background_file = background
+        self.background = (load_background(background)
+                           if background is not None else None)
+        # Frozen stage-A ridgeline that fixes the Eq.31 window centre. Same
+        # file measure_step1_edge.py measured the edge about.
+        self.background_ref_file = background_ref
+        self.background_ref = None
+        if background_ref is not None:
+            _res, _ = load_params(background_ref)
+            self.background_ref = make_spline_functions(_res)
+        self.delta_p = delta_p
 
         # State variables
         self.df_red = None  # Selected red galaxies
@@ -296,6 +317,8 @@ class RedCatalogue:
             Fitted parameters with keys 'nodes', 'a_params', 'b_params', 'c_params'
         """
         self.mref_bin = mref_bin
+        # remembered so save_ridge_line records the pivot the fit used
+        self.smooth_mref, self.smooth_s = bool(smooth_mref), float(smooth_s)
         if df is None:
             if self.df_red is None:
                 raise ValueError("No red galaxy sample. Run select_red_sequence first.")
@@ -360,6 +383,9 @@ class RedCatalogue:
             loss=self.loss,
             cap_last_node=self.cap_last_node,
             truncation=self.truncation,
+            background=self.background,
+            background_ref=self.background_ref,
+            delta_p=self.delta_p,
         )
 
         # Setup data (pass m_ref_func to use proper reference magnitude)
@@ -367,6 +393,11 @@ class RedCatalogue:
             df, self.color_definitions, self.magnitude_col, self.z_spec_col,
             m_ref_func=self.m_ref_func
         )
+
+        # Context for the optional stage-1 box-leakage term (RIDGELINE_XCOV_LEAK)
+        self.fitter._leak_ctx = dict(df=df, color_definitions=self.color_definitions,
+                                     magnitude_col=self.magnitude_col,
+                                     z_spec_col=self.z_spec_col, smooth_mref=smooth_mref)
 
         # Fit (Stage A: a/b/c per color; optional Stage B: r(z) cross-cov)
         self.fit_results = self.fitter.fit(
@@ -397,8 +428,8 @@ class RedCatalogue:
         return self.fit_results
 
     def load_ridge_line(self, filepath: str,
-                        smooth_mref: bool = False,
-                        smooth_s: float = 0.15,
+                        smooth_mref: Optional[bool] = None,
+                        smooth_s: Optional[float] = None,
                         verbose: bool = True) -> None:
         """
         Load pre-fitted ridge line parameters from disk.
@@ -407,8 +438,12 @@ class RedCatalogue:
         ----------
         filepath : str
             Full path to ridge line file (e.g., 'folder/ridgeline_Euclid_Q1.npz')
-        smooth_mref : bool
-            If True, apply splrep smoothing to reference magnitude (default: False)
+        smooth_mref : bool or None
+            None (default): rebuild m_ref(z) exactly as the fit did -- read
+            ``m_ref_smooth`` from the file; ridgelines written before that flag
+            existed fall back to True, since every step-2 run used
+            --smooth-mref yes (fiducial, 2026-09-23). An explicit True/False
+            overrides, with a warning when it contradicts the file.
         smooth_s : float
             Smoothing parameter for splrep when smooth_mref=True (default: 0.15)
         verbose : bool
@@ -416,6 +451,19 @@ class RedCatalogue:
         """
         self.fit_results, m_ref_data = load_params(filepath)
         self.splines = make_spline_functions(self.fit_results, self.color_names)
+
+        # m_ref(z) pivot: rebuild it the way the fit did (see docstring)
+        _d = np.load(filepath, allow_pickle=True)
+        stored = bool(_d['m_ref_smooth']) if 'm_ref_smooth' in _d.files else None
+        stored_s = float(_d['m_ref_smooth_s']) if 'm_ref_smooth_s' in _d.files else None
+        if smooth_mref is None:
+            smooth_mref = True if stored is None else stored
+        elif stored is not None and bool(smooth_mref) != stored:
+            print(f"  WARNING load_ridge_line: smooth_mref={smooth_mref} but the fit used "
+                  f"smooth_mref={stored}; the m_ref(z) pivot will NOT match the fit")
+        if smooth_s is None:
+            smooth_s = stored_s if stored_s is not None else 0.15
+        self.smooth_mref, self.smooth_s = bool(smooth_mref), float(smooth_s)
 
         # Reconstruct reference magnitude function if data is available
         if m_ref_data is not None:
@@ -462,7 +510,9 @@ class RedCatalogue:
         m_ref_z = getattr(self, 'm_ref_z', None)
         m_ref_values = getattr(self, 'm_ref_values', None)
 
-        save_params(self.fit_results, filepath, m_ref_z=m_ref_z, m_ref_values=m_ref_values)
+        save_params(self.fit_results, filepath, m_ref_z=m_ref_z, m_ref_values=m_ref_values,
+                    m_ref_smooth=getattr(self, 'smooth_mref', None),
+                    m_ref_smooth_s=getattr(self, 'smooth_s', None))
 
         if verbose:
             print(f"Saved ridge line parameters to {filepath}")
@@ -476,7 +526,8 @@ class RedCatalogue:
                        return_chi2: bool = False,
                        offset: bool = False,
                        use_cross_covariance: bool = True,
-                       verbose: bool = True) -> pd.DataFrame:
+                       verbose: bool = True,
+                       optional_colours: Optional[List[str]] = None) -> pd.DataFrame:
         """
         Step 3: Estimate photometric redshifts.
 
@@ -505,6 +556,10 @@ class RedCatalogue:
             carries — diagnostic for the DR1 wide photo-z failure.
         verbose : bool
             Print progress
+        optional_colours : list of str, optional
+            Colours a galaxy may lack (e.g. ['ug'] for u non-detections): such a galaxy
+            is fitted on the exact marginal of its remaining colours. Default: none
+            (any missing colour -> NaN, the previous behaviour).
 
         Returns
         -------
@@ -567,6 +622,7 @@ class RedCatalogue:
             offset_func=offset_func,
             apply_offset=offset,
             r_splines=r_splines,
+            optional_colours=optional_colours,
         )
 
         # Estimate photo-z
@@ -843,7 +899,9 @@ class RedCatalogue:
                                 compute_luminosity_diagnostics: bool = False,
                                 l_thresholds: List[float] = [0.5, 1.0],
                                 offset_interp: str = 'cubic',
-                                verbose: bool = True) -> Tuple[Callable, Dict]:
+                                calib_z_spec_max: Optional[float] = None,
+                                verbose: bool = True,
+                                optional_colours: Optional[List[str]] = None) -> Tuple[Callable, Dict]:
         """
         Calibrate photo-z offset function using spectroscopic sample.
 
@@ -889,6 +947,15 @@ class RedCatalogue:
         l_thresholds : list of float
             Luminosity thresholds to evaluate when compute_luminosity_diagnostics=True.
             Default: [0.5, 1.0] (dense and luminous samples).
+        calib_z_spec_max : float, optional
+            If given, drop galaxies with z_spec > this value from BOTH the
+            train and validation halves AFTER the random split, so the
+            positional train/val assignment (and any downstream `is_val`
+            mask rebuilt from the same seed on the full sample) is unchanged.
+            Use it when the photo-z search bound z_max sits below the spec-z
+            sample's own upper edge: galaxies above z_max cannot be reached
+            by the bounded optimizer, rail at z_raw = z_max, and would
+            otherwise drag the top offset node up. Default: None (no cut).
         verbose : bool
             Print progress and diagnostics
 
@@ -948,6 +1015,18 @@ class RedCatalogue:
             print(f"\nTrain set: {len(df_train)} galaxies ({100*train_fraction:.1f}%)")
             print(f"Validation set: {len(df_val)} galaxies ({100*(1-train_fraction):.1f}%)")
 
+        # Optional z_spec ceiling on the calibration sample, applied AFTER the
+        # split so the positional train/val draw above is untouched.
+        if calib_z_spec_max is not None:
+            n_tr0, n_va0 = len(df_train), len(df_val)
+            df_train = df_train[df_train[self.z_spec_col] <= calib_z_spec_max]
+            df_val = df_val[df_val[self.z_spec_col] <= calib_z_spec_max]
+            if verbose:
+                print(f"  calib_z_spec_max={calib_z_spec_max}: dropped "
+                      f"{n_tr0 - len(df_train)} train / {n_va0 - len(df_val)} val "
+                      f"galaxies with z_spec > {calib_z_spec_max} "
+                      f"-> {len(df_train)} / {len(df_val)} kept")
+
         # Get true redshifts
         z_spec_train = df_train[self.z_spec_col].values
         z_spec_val = df_val[self.z_spec_col].values
@@ -974,6 +1053,7 @@ class RedCatalogue:
             offset_func=None,
             apply_offset=False,
             r_splines=r_splines,
+            optional_colours=optional_colours,
         )
 
         df_train_phot = temp_fitter.estimate_photoz(
@@ -1047,6 +1127,7 @@ class RedCatalogue:
                 offset_func=offset_func,
                 apply_offset=True,
                 r_splines=r_splines,
+                optional_colours=optional_colours,
             )
 
             df_val_phot = val_fitter.estimate_photoz(

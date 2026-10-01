@@ -451,7 +451,8 @@ class PhotoZEstimator:
                  z_max: float = 1.0,
                  offset_func: Optional[Callable] = None,
                  apply_offset: bool = False,
-                 r_splines: Optional[Dict[Tuple[int, int], CubicSpline]] = None):
+                 r_splines: Optional[Dict[Tuple[int, int], CubicSpline]] = None,
+                 optional_colours: Optional[List[str]] = None):
         self.splines = spline_functions
         self.m_ref_func = m_ref_func
         self.colour_names = colour_names
@@ -463,6 +464,11 @@ class PhotoZEstimator:
         self.apply_offset = apply_offset
         # Optional cross-covariance r(z) splines, keyed by colour-index pair.
         self.r_splines = r_splines or {}
+        # Colours a galaxy may lack (e.g. u-g for a u non-detection): the fit then
+        # uses the exact Gaussian marginal over the remaining colours (sub-block of
+        # C_obs + C_int). The dimension is fixed per galaxy, so J(z) stays comparable
+        # across trial z. Any other missing colour still gives NaN.
+        self.optional_idx = {colour_names.index(c) for c in (optional_colours or [])}
 
         if self.apply_offset and self.offset_func is None:
             raise ValueError("apply_offset=True requires offset_func to be provided")
@@ -560,7 +566,7 @@ class PhotoZEstimator:
         return np.log(self.cosmo.differential_comoving_volume(z).value)
 
     def objective_function(self, z: float, c_obs: np.ndarray, m_obs: float,
-                          C_obs: np.ndarray) -> float:
+                          C_obs: np.ndarray, idx: Optional[np.ndarray] = None) -> float:
         """
         Compute -2 ln p(z|c,m) for photo-z estimation.
 
@@ -582,12 +588,15 @@ class PhotoZEstimator:
         """
         z = float(z)
 
-        # Total covariance
+        # Total covariance (idx: colours this galaxy has; c_obs, C_obs already cut to them)
         C_int = self.intrinsic_covariance(z)
+        c_model = self.color_model(z, m_obs)
+        if idx is not None:
+            C_int = C_int[np.ix_(idx, idx)]
+            c_model = c_model[idx]
         C_tot = C_obs + C_int
 
         # Color chi-squared
-        c_model = self.color_model(z, m_obs)
         chi2 = self.chi_squared(c_obs, c_model, C_tot)
 
         # Log determinant term
@@ -640,15 +649,21 @@ class PhotoZEstimator:
         # Non-finite photometry (NaN/inf mags, errors, covariance) makes the
         # optimizers raise deep inside scipy/linalg; on wide-survey input a
         # single such row must not kill the batch — it just gets NaN.
+        idx = None
+        have = np.isfinite(c_obs) & np.isfinite(np.diagonal(C_obs))
+        if not have.all() and self.optional_idx and have.any() \
+                and set(np.flatnonzero(~have)) <= self.optional_idx:
+            idx = np.flatnonzero(have)
+            c_obs, C_obs = c_obs[idx], C_obs[np.ix_(idx, idx)]
         if (not np.all(np.isfinite(c_obs)) or not np.isfinite(m_obs)
                 or not np.all(np.isfinite(C_obs))):
             return (np.nan, np.nan) if return_chi2 else np.nan
 
         try:
             if method == 'iminuit':
-                z_best = self._estimate_iminuit(c_obs, m_obs, C_obs, z_init)
+                z_best = self._estimate_iminuit(c_obs, m_obs, C_obs, z_init, idx)
             elif method == 'differential_evolution':
-                z_best = self._estimate_differential_evolution(c_obs, m_obs, C_obs)
+                z_best = self._estimate_differential_evolution(c_obs, m_obs, C_obs, idx)
             else:
                 raise ValueError(f"Unknown method: {method}. Use 'iminuit' or 'differential_evolution'")
         except (ValueError, RuntimeError, np.linalg.LinAlgError):
@@ -664,15 +679,17 @@ class PhotoZEstimator:
                 chi2 = np.nan
             else:
                 C_int = self.intrinsic_covariance(z_best)
-                C_tot = C_obs + C_int
                 c_model = self.color_model(z_best, m_obs)
-                chi2 = self.chi_squared(c_obs, c_model, C_tot)
+                if idx is not None:
+                    C_int = C_int[np.ix_(idx, idx)]
+                    c_model = c_model[idx]
+                chi2 = self.chi_squared(c_obs, c_model, C_obs + C_int)
             return z_best, chi2
         else:
             return z_best
 
     def _estimate_iminuit(self, c_obs: np.ndarray, m_obs: float,
-                         C_obs: np.ndarray, z_init: float) -> float:
+                         C_obs: np.ndarray, z_init: float, idx=None) -> float:
         """
         Estimate photo-z using iminuit.
 
@@ -693,7 +710,7 @@ class PhotoZEstimator:
             Best-fit redshift (or NaN if fit failed)
         """
         def wrapped_nll(z):
-            return self.objective_function(z, c_obs, m_obs, C_obs)
+            return self.objective_function(z, c_obs, m_obs, C_obs, idx)
 
         m = Minuit(wrapped_nll, z=z_init)
         m.limits['z'] = (self.z_min, self.z_max)
@@ -706,7 +723,7 @@ class PhotoZEstimator:
         return m.values['z']
 
     def _estimate_differential_evolution(self, c_obs: np.ndarray, m_obs: float,
-                                         C_obs: np.ndarray) -> float:
+                                         C_obs: np.ndarray, idx=None) -> float:
         """
         Estimate photo-z using scipy's differential_evolution (global optimizer).
 
@@ -725,7 +742,7 @@ class PhotoZEstimator:
             Best-fit redshift (or NaN if fit failed)
         """
         def wrapped_nll(z):
-            return self.objective_function(z[0], c_obs, m_obs, C_obs)
+            return self.objective_function(z[0], c_obs, m_obs, C_obs, idx)
 
         bounds = [(self.z_min, self.z_max)]
         result = differential_evolution(wrapped_nll, bounds=bounds)
@@ -892,7 +909,8 @@ class PhotoZFitter:
                  z_max: float = 1.0,
                  offset_func: Optional[Callable] = None,
                  apply_offset: bool = False,
-                 r_splines: Optional[Dict[Tuple[int, int], CubicSpline]] = None):
+                 r_splines: Optional[Dict[Tuple[int, int], CubicSpline]] = None,
+                 optional_colours: Optional[List[str]] = None):
         # Create Schechter function
         if schechter_params is None:
             raise ValueError(
@@ -908,7 +926,7 @@ class PhotoZFitter:
             schechter=schechter, cosmology=cosmology,
             z_min=z_min, z_max=z_max,
             offset_func=offset_func, apply_offset=apply_offset,
-            r_splines=r_splines,
+            r_splines=r_splines, optional_colours=optional_colours,
         )
 
         self.colour_names = colour_names

@@ -330,8 +330,15 @@ def _run_bin_task(task, magnitude_col, z_spec_col, sigma_multiplier,
                   stage2_degeneracy_mode="reject",
                   stage1_chisq_sigma=0.866,
                   stage2_chisq_sigma=0.866,
-                  pi_min=0.05):
+                  pi_min=0.05,
+                  stage1_mode="ridgeline",
+                  stage2_on_parent=False):
     """Run two-stage XD GMM on one z-bin, N times, returning soft membership p_red.
+
+    stage2_on_parent=True: the stage-1 cut only picks the galaxies the stage-2
+    XD is FITTED on; the stage-2 ellipsoid is then applied to every galaxy of
+    the bin, so the stage-1 box is not part of the selection (the step-2
+    truncation term is then the stage-2 taper alone, no box, no leak).
 
     For n_realizations=1 (default), behaviour matches the original hard
     selection: returned DataFrame is the selected red galaxies with p_red=1.
@@ -339,12 +346,14 @@ def _run_bin_task(task, magnitude_col, z_spec_col, sigma_multiplier,
     For n_realizations>1, each row of df_bin is included if it was selected
     in at least one realization, with p_red = (#selected) / (#successful runs).
     """
-    _, _, _, df_bin, colors_bin = task
+    z_low, z_high, z_mid, df_bin, colors_bin = task
 
     # Track selection counts on the bin's index (preserved through filtering).
     selection_count = pd.Series(0, index=df_bin.index, dtype=int)
+    stage1_count = pd.Series(0, index=df_bin.index, dtype=int)
     m_refs = []
     n_success = 0
+    bin_fit = None
 
     for k in range(n_realizations):
         selector_bin = RedSequenceSelector(
@@ -363,6 +372,7 @@ def _run_bin_task(task, magnitude_col, z_spec_col, sigma_multiplier,
             stage1_chisq_sigma=stage1_chisq_sigma,
             stage2_chisq_sigma=stage2_chisq_sigma,
             pi_min=pi_min,
+            stage1_mode=stage1_mode,
         )
         try:
             selector_bin._gmm_stage1(verbose=False)
@@ -372,17 +382,44 @@ def _run_bin_task(task, magnitude_col, z_spec_col, sigma_multiplier,
         if len(selector_bin.df) == 0:
             continue
         selected_idx = selector_bin.df.index
+        if stage2_on_parent:
+            fit2 = selector_bin.stage2_fit
+            if fit2 is None:
+                raise RuntimeError("stage2_on_parent needs the 2-component stage-2 fit "
+                                   "(stage2_single_gaussian / degeneracy fallback store no window)")
+            Xp, Cp = create_color_arrays_and_covariance(df_bin, colors_bin, magnitude_col)
+            r = Xp - np.asarray(fit2["mu"], float)
+            G = np.asarray(fit2["V"], float)[None] + Cp
+            good = np.isfinite(r).all(axis=1) & np.isfinite(G).all(axis=(1, 2))
+            D2 = np.full(len(df_bin), np.inf)
+            D2[good] = np.einsum("ni,ni->n", r[good],
+                                 np.linalg.solve(G[good], r[good][..., None])[..., 0])
+            selected_idx = df_bin.index[D2 < fit2["chi2_crit"]]
+            fit2["n_pass_parent"] = int(len(selected_idx))
         selection_count.loc[selected_idx] += 1
+        if selector_bin.stage1_pass_index is not None:
+            stage1_count.loc[selector_bin.stage1_pass_index] += 1
         m_refs.append(np.median(selector_bin.df[magnitude_col].values))
         n_success += 1
+        # Keep the LAST successful realisation's windows (exact for
+        # n_realizations=1, representative otherwise).
+        bin_fit = {"z_low": float(z_low), "z_high": float(z_high), "z_mid": float(z_mid),
+                   "colors": [f"{a}{b}" for a, b in colors_bin],
+                   "seed": int(base_seed + k), "n_realizations_ok": n_success,
+                   "stage2_on_parent": bool(stage2_on_parent),
+                   "stage1": selector_bin.stage1_fit, "stage2": selector_bin.stage2_fit}
 
     if n_success == 0:
-        return pd.DataFrame(), np.nan
+        return pd.DataFrame(), np.nan, None
 
     out = df_bin.copy()
     out["p_red"] = selection_count.values / float(n_success)
-    out = out[out["p_red"] > 0].copy()
-    return out, float(np.median(m_refs))
+    out["p_stage1"] = stage1_count.values / float(n_success)
+    # Keep stage-1 passers that stage 2 rejected too (p_red=0, p_stage1>0):
+    # downstream reads p_red >= p_red_min so they are inert there, and the
+    # step-1 diagnostics need them to see what stage 2 removes.
+    out = out[(out["p_red"] > 0) | (out["p_stage1"] > 0)].copy()
+    return out, float(np.median(m_refs)), bin_fit
 
 
 class RedSequenceSelector:
@@ -405,6 +442,21 @@ class RedSequenceSelector:
         Width of redshift bins (default: 0.03)
     color_switch_z : float, optional
         Redshift at which to switch color order (default: 0.5)
+    color_switch_z2 : float, optional
+        Second switch: at z_low >= color_switch_z2 the colour with index
+        ``high_z_first`` in ``color_definitions`` (default 2 = i-z in the
+        gr/ri/iz/ug basis) becomes the stage-1 reference colour, with the
+        previous reference colours following it (i-z, r-i, g-r, u-g).
+        None (default) keeps the single switch.
+    high_z_first : int, optional
+        Index (in ``color_definitions``) of the colour put first above
+        ``color_switch_z2`` (default: 2).
+    drop_u_z : float, optional
+        Bins with z_low >= drop_u_z leave the u-g colour out entirely (stage 2
+        becomes 3-D and u NaN rows survive the per-bin NaN drop). Above z~0.4
+        u-g carries almost no redshift information while the u DETECTION
+        requirement removes 6% (z=0.40) to ~40% (z>0.8) of red spec-z galaxies.
+        None (default) keeps u-g in every bin.
     use_binning : bool, optional
         Whether to use redshift binning (default: True)
     """
@@ -412,6 +464,7 @@ class RedSequenceSelector:
     def __init__(self, df, magnitude_col, color_definitions,
                  z_spec_col='z_spec', sigma_multiplier=2.0,
                  z_bin_width=0.03, color_switch_z=0.42, use_binning=True,
+                 color_switch_z2=None, high_z_first=2, drop_u_z=None,
                  z_min=None, z_max=None, n_jobs=1, n_realizations=1,
                  random_state=None,
                  n_components_stage1=4, stage2_single_gaussian=False,
@@ -420,12 +473,24 @@ class RedSequenceSelector:
                  stage1_chisq_sigma=0.866,
                  stage2_chisq_sigma=0.866,
                  pi_min=0.05,
-                 z_step=None):
+                 z_step=None,
+                 stage1_mode="ridgeline",
+                 red_jump_max=None,
+                 stage2_on_parent=False):
         self.df = df.copy()
+        # the stage-2 ellipsoid cuts the whole bin; stage 1 only picks its fit sample
+        self.stage2_on_parent = stage2_on_parent
         self.pi_min = pi_min
         self.z_step = z_step
         self.stage1_chisq_sigma = stage1_chisq_sigma
         self.stage2_chisq_sigma = stage2_chisq_sigma
+        if stage1_mode not in ("ridgeline", "component"):
+            raise ValueError(f"stage1_mode must be 'ridgeline' or 'component', "
+                             f"got {stage1_mode!r}")
+        self.stage1_mode = stage1_mode
+        # disjoint mode: reject a bin whose red stage-2 mean in the reference
+        # colour jumps by more than this from the previous accepted bin (None = off)
+        self.red_jump_max = red_jump_max
         self.magnitude_col = magnitude_col
         self.color_definitions = color_definitions
         self.z_spec_col = z_spec_col
@@ -433,6 +498,9 @@ class RedSequenceSelector:
         self.n_colors = len(color_definitions)
         self.z_bin_width = z_bin_width
         self.color_switch_z = color_switch_z
+        self.color_switch_z2 = color_switch_z2
+        self.high_z_first = high_z_first
+        self.drop_u_z = drop_u_z
         self.use_binning = use_binning
         self.z_min = z_min
         self.z_max = z_max
@@ -449,6 +517,14 @@ class RedSequenceSelector:
 
         # Storage for per-bin reference magnitudes
         self.m_ref_per_bin = []
+        # Fitted selection windows, filled by the stage methods (component-mode
+        # stage 1 and stage 2). Exported per bin by _select_with_binning as
+        # self.bin_fits so the step-1 cut is known analytically downstream
+        # (truncation half-width t^2 = chi2_crit * (V + C_i)) and can be
+        # overlaid on red-vs-parent colour diagnostics.
+        self.stage1_fit = None
+        self.stage2_fit = None
+        self.stage1_pass_index = None
 
         # Preprocess and build covariance matrices (if not using binning)
         if not use_binning:
@@ -629,12 +705,7 @@ class RedSequenceSelector:
                 continue
             z_low = bin_label.left
             z_mid = (bin_label.left + bin_label.right) / 2.0
-            if z_low < self.color_switch_z:
-                colors_bin = self.color_definitions
-            else:
-                colors_bin = [self.color_definitions[1], self.color_definitions[0]]
-                if len(self.color_definitions) > 2:
-                    colors_bin += self.color_definitions[2:]
+            colors_bin = self.colors_for_bin(z_low)
             tasks.append((z_low, bin_label.right, z_mid,
                           group.drop('z_bins', axis=1), colors_bin))
 
@@ -656,6 +727,8 @@ class RedSequenceSelector:
                 stage2_degeneracy_eps=self.stage2_degeneracy_eps,
                 stage2_degeneracy_mode=self.stage2_degeneracy_mode,
                 stage1_chisq_sigma=self.stage1_chisq_sigma,
+                stage1_mode=self.stage1_mode,
+                stage2_on_parent=self.stage2_on_parent,
                 stage2_chisq_sigma=self.stage2_chisq_sigma,
                 pi_min=self.pi_min,
             ) for i, t in enumerate(tasks)]
@@ -678,6 +751,8 @@ class RedSequenceSelector:
                         stage2_degeneracy_eps=self.stage2_degeneracy_eps,
                         stage2_degeneracy_mode=self.stage2_degeneracy_mode,
                         stage1_chisq_sigma=self.stage1_chisq_sigma,
+                        stage1_mode=self.stage1_mode,
+                        stage2_on_parent=self.stage2_on_parent,
                         stage2_chisq_sigma=self.stage2_chisq_sigma,
                         pi_min=self.pi_min,
                     ) for i, t in enumerate(tasks)
@@ -689,7 +764,34 @@ class RedSequenceSelector:
         # Reassemble in order.
         df_red_list = []
         self.m_ref_per_bin = []
-        for (_, _, z_mid, _, _), (df_bin_red, m_ref) in zip(tasks, results):
+        self.bin_fits = []
+        self.rejected_bins = []
+        prev_mu2 = None          # stage-2 means (by colour name) of the last accepted bin
+        for (_, _, z_mid, _, _), (df_bin_red, m_ref, bin_fit) in zip(tasks, results):
+            # Continuity guard: when the red component is near pi_min (red
+            # fraction ~5% at z>1.1) it can be masked and the reddest
+            # REMAINING component -- the blue cloud -- taken as red (z2 bin
+            # [1.18,1.20): r-i 0.78 -> 0.14, 13k blue galaxies flagged red).
+            # Reject a bin whose reference-colour stage-2 mean jumps by more
+            # than red_jump_max from the last accepted bin.
+            if (self.red_jump_max is not None and bin_fit is not None
+                    and bin_fit.get("stage2") and prev_mu2 is not None):
+                ref = bin_fit["colors"][0]
+                mu_ref = bin_fit["stage2"]["mu"][0]
+                if ref in prev_mu2 and abs(mu_ref - prev_mu2[ref]) > self.red_jump_max:
+                    self.rejected_bins.append({"z_low": bin_fit["z_low"], "ref": ref,
+                                               "mu2_ref": float(mu_ref),
+                                               "prev_mu2_ref": float(prev_mu2[ref])})
+                    if verbose:
+                        print(f"  z_mid={z_mid:.3f}: REJECTED by continuity guard "
+                              f"({ref} stage-2 mean {mu_ref:.3f} vs {prev_mu2[ref]:.3f})")
+                    continue
+            if bin_fit is not None and bin_fit.get("stage2"):
+                prev_mu2 = dict(zip(bin_fit["colors"], bin_fit["stage2"]["mu"]))
+            if bin_fit is not None:
+                bin_fit["m_ref"] = float(m_ref)
+                bin_fit["n_red"] = int(len(df_bin_red))
+                self.bin_fits.append(bin_fit)
             if len(df_bin_red) > 0:
                 df_red_list.append(df_bin_red)
                 self.m_ref_per_bin.append((z_mid, m_ref))
@@ -748,12 +850,7 @@ class RedSequenceSelector:
             if not in_win.any():
                 continue
             group = df_work.loc[in_win]
-            if zlo < self.color_switch_z:
-                colors_bin = self.color_definitions
-            else:
-                colors_bin = [self.color_definitions[1], self.color_definitions[0]]
-                if len(self.color_definitions) > 2:
-                    colors_bin = colors_bin + list(self.color_definitions[2:])
+            colors_bin = self.colors_for_bin(zlo)
             tasks.append((zlo, zhi, zmid, group, colors_bin))
 
         if verbose:
@@ -771,6 +868,8 @@ class RedSequenceSelector:
                 stage2_degeneracy_eps=self.stage2_degeneracy_eps,
                 stage2_degeneracy_mode=self.stage2_degeneracy_mode,
                 stage1_chisq_sigma=self.stage1_chisq_sigma,
+                stage1_mode=self.stage1_mode,
+                stage2_on_parent=self.stage2_on_parent,
                 stage2_chisq_sigma=self.stage2_chisq_sigma,
                 pi_min=self.pi_min,
             ) for i, t in enumerate(tasks)]
@@ -793,6 +892,8 @@ class RedSequenceSelector:
                         stage2_degeneracy_eps=self.stage2_degeneracy_eps,
                         stage2_degeneracy_mode=self.stage2_degeneracy_mode,
                         stage1_chisq_sigma=self.stage1_chisq_sigma,
+                        stage1_mode=self.stage1_mode,
+                        stage2_on_parent=self.stage2_on_parent,
                         stage2_chisq_sigma=self.stage2_chisq_sigma,
                         pi_min=self.pi_min,
                     ) for i, t in enumerate(tasks)
@@ -802,7 +903,8 @@ class RedSequenceSelector:
                     limiter.unregister()
 
         self.m_ref_per_bin = []
-        for (zlo, zhi, zmid, group, _), (df_win, m_ref) in zip(tasks, results):
+        self.bin_fits = [r[2] for r in results if r[2] is not None]
+        for (zlo, zhi, zmid, group, _), (df_win, m_ref, _fit) in zip(tasks, results):
             elig_idx = group.index.values
             n_eligible[elig_idx] += 1
             if len(df_win) > 0:
@@ -849,7 +951,8 @@ class RedSequenceSelector:
             colors_bin,
             z_spec_col=self.z_spec_col,
             sigma_multiplier=self.sigma_multiplier,
-            use_binning=False  # Don't recurse!
+            use_binning=False,  # Don't recurse!
+            stage1_mode=self.stage1_mode,
         )
 
         # Run GMM stages
@@ -867,6 +970,30 @@ class RedSequenceSelector:
                 print(f"    ⚠ GMM failed for this bin: {e}")
             return pd.DataFrame(), np.nan
 
+    def colors_for_bin(self, z_low):
+        """Colour order used in the bin starting at ``z_low``.
+
+        Element 0 is the stage-1 reference colour (and the colour whose
+        component mean identifies the red population in stage 2):
+          z_low <  color_switch_z                : as given   (g-r first)
+          color_switch_z <= z_low < switch_z2    : colour[1] first (r-i)
+          z_low >= color_switch_z2 (if set)      : colour[high_z_first] first,
+                                                   then r-i, g-r, the rest.
+        Colours involving u are then dropped if z_low >= drop_u_z (if set).
+        """
+        defs = list(self.color_definitions)
+        if self.color_switch_z2 is not None and z_low >= self.color_switch_z2 - 1e-9:
+            k = self.high_z_first
+            out = [defs[k]] + [d for i, d in enumerate(defs) if i != k and i in (0, 1)][::-1] \
+                + [d for i, d in enumerate(defs) if i not in (0, 1, k)]
+        elif z_low < self.color_switch_z:
+            out = defs
+        else:
+            out = [defs[1], defs[0]] + defs[2:]
+        if self.drop_u_z is not None and z_low >= self.drop_u_z - 1e-9:
+            out = [d for d in out if 'u' not in d]
+        return out
+
     def _gmm_stage1(self, verbose=False):
         """
         Stage 1: 2D GMM in (magnitude, color) space (Section 3.2 of Vakili+2019).
@@ -879,6 +1006,9 @@ class RedSequenceSelector:
         verbose : bool, optional
             Print progress information (default: False)
         """
+        if self.stage1_mode == "component":
+            return self._gmm_stage1_component(verbose=verbose)
+
         X = self.data_vector[:, 0:2]
         Xerr = self.magc_covariance
 
@@ -900,6 +1030,72 @@ class RedSequenceSelector:
 
         # Apply chi-squared filtering based on red component
         self._filter_by_chisq_2d(clf, red_population, sigma=self.stage1_chisq_sigma)
+
+    def _gmm_stage1_component(self, verbose=False):
+        """Stage 1, redMaPPer flavour (Rykoff et al. 2014, Sect 6.2 step 1).
+
+        Fits the GMM in the REFERENCE COLOUR ALONE and cuts about the
+        component MEAN with the component's MARGINAL width:
+
+            (c - mu_red)^2 / (V_red + C_phot)  <  chi2.ppf(sigma, df=1)
+
+        Contrast `_gmm_stage1` + `_filter_by_chisq_2d`, which fit in
+        (m, c) and cut about the fitted RIDGELINE with the CONDITIONAL width:
+
+            (c - [c_ref + (V12/V11)(m - m_ref)])^2 / (S_mod^2 + C_phot) < ...
+            S_mod^2 = V22 - V12^2/V11   <=   V22
+
+        Two consequences, both deliberate. The cut no longer depends on a(z),
+        b(z) or S_mod, so step 1 stops imprinting the quantities step 2 goes on
+        to measure -- that is the whole point of this mode. And because the
+        marginal width is never smaller than the conditional one, the cut is
+        looser at fixed sigma, though it also loses the magnitude tilt, so at
+        matched sigma the two select samples of very similar size (measured on
+        the UNIONS z sample: 284,912 vs 303,598, agreeing on 89-97% of galaxies
+        per z bin).
+
+        The chi-squared threshold is IDENTICAL to ridgeline mode -- same
+        `stage1_chisq_sigma`, same 1 dof -- so a sigma ladder means the same
+        thing in both modes and the two are directly comparable.
+        """
+        c = self.data_vector[:, 1]
+        cvar = self.magc_covariance[:, 1, 1]
+
+        clf = XDGMM(n_components=self.n_components_stage1, max_iter=2000,
+                    tol=1e-10, verbose=False,
+                    random_state=self.random_state)
+        clf.fit(c.reshape(-1, 1), cvar.reshape(-1, 1, 1))
+
+        # Minimum-weight guard BEFORE the argmax: a collapsed EM component
+        # (weight ~0, variance ~2) otherwise wins on its reddest mean and the
+        # cut then keeps the whole bin.
+        mean_color = np.where(clf.alpha > self.pi_min, clf.mu[:, 0], -np.inf)
+        if not np.isfinite(mean_color).any():
+            self._apply_mask(np.zeros(len(self.df), dtype=bool))
+            if verbose:
+                print("Stage 1 (component): no component above pi_min -- bin rejected")
+            return
+        red_population = int(np.argmax(mean_color))
+
+        mu = float(clf.mu[red_population, 0])
+        V_red = max(float(clf.V[red_population, 0, 0]), 1e-8)
+        if verbose:
+            print(f"Stage 1 (component): red fraction = "
+                  f"{clf.alpha[red_population]:.2f}, mu = {mu:.3f}, "
+                  f"sigma_int = {np.sqrt(V_red):.4f}")
+
+        critical_value = chi2.ppf(self.stage1_chisq_sigma, df=1)
+        chi2_vals = (c - mu) ** 2 / (V_red + cvar)
+        mask = chi2_vals < critical_value
+        self.stage1_fit = {
+            "mode": "component", "mu": mu, "V": V_red,
+            "pi": float(clf.alpha[red_population]), "chi2_crit": float(critical_value),
+            "n_in": int(len(c)), "n_pass": int(mask.sum()),
+            "components_mu": clf.mu[:, 0].tolist(), "components_V": clf.V[:, 0, 0].tolist(),
+            "components_pi": clf.alpha.tolist(),
+        }
+        self.stage1_pass_index = self.df.index[mask]
+        self._apply_mask(mask)
 
     def _filter_by_chisq_2d(self, clf, red_population, sigma):
         """
@@ -1048,8 +1244,16 @@ class RedSequenceSelector:
         if verbose:
             print(f"Stage 2: Red fraction = {frac_red:.2f}")
 
+        self.stage2_fit = {
+            "mu": clf.mu[red_population].tolist(),
+            "V": clf.V[red_population].tolist(),
+            "pi": float(frac_red),
+            "chi2_crit": float(chi2.ppf(self.stage2_chisq_sigma, df=X.shape[1])),
+            "n_in": int(len(X)),
+        }
         # Filter by chi-squared in color space
         self._filter_by_chisq_nd(X, clf, red_population, sigma=self.stage2_chisq_sigma)
+        self.stage2_fit["n_pass"] = int(len(self.df))
 
     def _filter_by_chisq_nd(self, X, clf, red_population, sigma):
         """
