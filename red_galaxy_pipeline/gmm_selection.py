@@ -331,6 +331,7 @@ def _run_bin_task(task, magnitude_col, z_spec_col, sigma_multiplier,
                   stage1_chisq_sigma=0.866,
                   stage2_chisq_sigma=0.866,
                   pi_min=0.05,
+                  stage2_component="reddest",
                   stage1_mode="ridgeline",
                   stage2_on_parent=False):
     """Run two-stage XD GMM on one z-bin, N times, returning soft membership p_red.
@@ -372,6 +373,7 @@ def _run_bin_task(task, magnitude_col, z_spec_col, sigma_multiplier,
             stage1_chisq_sigma=stage1_chisq_sigma,
             stage2_chisq_sigma=stage2_chisq_sigma,
             pi_min=pi_min,
+            stage2_component=stage2_component,
             stage1_mode=stage1_mode,
         )
         try:
@@ -459,6 +461,10 @@ class RedSequenceSelector:
         None (default) keeps u-g in every bin.
     use_binning : bool, optional
         Whether to use redshift binning (default: True)
+    stage2_component : {"reddest", "max_weight"}, optional
+        Which stage-2 XD component is the red sequence: the one with the
+        reddest first-colour mean among components with weight > pi_min
+        (default, historical behaviour) or the one with the largest weight.
     """
 
     def __init__(self, df, magnitude_col, color_definitions,
@@ -473,6 +479,7 @@ class RedSequenceSelector:
                  stage1_chisq_sigma=0.866,
                  stage2_chisq_sigma=0.866,
                  pi_min=0.05,
+                 stage2_component="reddest",
                  z_step=None,
                  stage1_mode="ridgeline",
                  red_jump_max=None,
@@ -481,6 +488,9 @@ class RedSequenceSelector:
         # the stage-2 ellipsoid cuts the whole bin; stage 1 only picks its fit sample
         self.stage2_on_parent = stage2_on_parent
         self.pi_min = pi_min
+        if stage2_component not in ("reddest", "max_weight"):
+            raise ValueError(f"stage2_component must be 'reddest' or 'max_weight', got {stage2_component!r}")
+        self.stage2_component = stage2_component
         self.z_step = z_step
         self.stage1_chisq_sigma = stage1_chisq_sigma
         self.stage2_chisq_sigma = stage2_chisq_sigma
@@ -731,6 +741,7 @@ class RedSequenceSelector:
                 stage2_on_parent=self.stage2_on_parent,
                 stage2_chisq_sigma=self.stage2_chisq_sigma,
                 pi_min=self.pi_min,
+                stage2_component=self.stage2_component,
             ) for i, t in enumerate(tasks)]
         else:
             from joblib import Parallel, delayed
@@ -755,6 +766,7 @@ class RedSequenceSelector:
                         stage2_on_parent=self.stage2_on_parent,
                         stage2_chisq_sigma=self.stage2_chisq_sigma,
                         pi_min=self.pi_min,
+                        stage2_component=self.stage2_component,
                     ) for i, t in enumerate(tasks)
                 )
             finally:
@@ -872,6 +884,7 @@ class RedSequenceSelector:
                 stage2_on_parent=self.stage2_on_parent,
                 stage2_chisq_sigma=self.stage2_chisq_sigma,
                 pi_min=self.pi_min,
+                stage2_component=self.stage2_component,
             ) for i, t in enumerate(tasks)]
         else:
             from joblib import Parallel, delayed
@@ -896,6 +909,7 @@ class RedSequenceSelector:
                         stage2_on_parent=self.stage2_on_parent,
                         stage2_chisq_sigma=self.stage2_chisq_sigma,
                         pi_min=self.pi_min,
+                        stage2_component=self.stage2_component,
                     ) for i, t in enumerate(tasks)
                 )
             finally:
@@ -1215,6 +1229,14 @@ class RedSequenceSelector:
         # components are red-enough; argmax is the right answer.
         mean_color = np.where(weights > pi_min, clf.mu[:, 0], -np.inf)
         red_population = int(np.argmax(mean_color))
+        # stage2_component="max_weight": the stage-1 cut has already isolated
+        # the red peak, so the dominant component is the red sequence. With
+        # "reddest", a broad minority component (pi ~0.05-0.09, the
+        # non-Gaussian wings) whose mean is marginally redder can be picked;
+        # with stage2_on_parent its wide ellipsoid then admits blue galaxies
+        # (Euclid DR1 widedeep, 2026-10-01: 6/54 slices, all seeds).
+        if self.stage2_component == "max_weight":
+            red_population = int(np.argmax(weights))
         frac_red = weights[red_population]
 
         # Optional near-degeneracy fallback. Two modes:
