@@ -1,6 +1,6 @@
 # Red Galaxy Pipeline
 
-Red sequence galaxy identification and photometric redshift estimation based on [Vakili et al. (2019)](https://arxiv.org/abs/1909.11736).
+Red sequence galaxy identification and photometric redshift estimation based on [Vakili et al. (2019)](https://arxiv.org/abs/1811.02518).
 
 ## Installation
 
